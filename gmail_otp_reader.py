@@ -203,6 +203,26 @@ class GmailOTPReader:
         return None
 
 
+# Standalone function for easy import
+def get_latest_otp(sender_filter="@forward-sms.com", max_age_seconds=1800):
+    """
+    Standalone function to get latest OTP from Gmail.
+
+    Args:
+        sender_filter: Email sender pattern (default: '@forward-sms.com')
+        max_age_seconds: Maximum time to wait for OTP in seconds (default: 1800 = 30 minutes)
+
+    Returns:
+        OTP code as string, or None if not found
+    """
+    reader = GmailOTPReader()
+    return reader.get_latest_otp(
+        sender_filter=sender_filter,
+        wait_seconds=60,
+        max_wait=max_age_seconds
+    )
+
+
 # Test function
 if __name__ == "__main__":
     reader = GmailOTPReader()
