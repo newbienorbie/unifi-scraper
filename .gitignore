@@ -1,0 +1,29 @@
+# --- Secrets & Config (NEVER UPLOAD THESE) ---
+.env
+service_account.json
+config/
+sessions/
+
+# --- Python & System Junk ---
+__pycache__/
+*.pyc
+venv/
+.DS_Store
+
+# --- Output Data & Logs ---
+outputs/
+logs/
+jobs/
+old/
+config_int/
+
+# --- Temporary/Debug Scripts ---
+debug.py
+check_ids.py
+run_scrape_*.py
+scrape_orders_OLD.py
+gmail_token_create.py
+test.py
+response.json
+*.jpg
+workflow.json

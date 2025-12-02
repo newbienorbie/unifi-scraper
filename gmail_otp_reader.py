@@ -14,6 +14,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+ALLOW_BROWSER_AUTH = os.getenv("GMAIL_ALLOW_BROWSER", "0") == "1"
 
 
 class GmailOTPReader:
@@ -31,13 +32,30 @@ class GmailOTPReader:
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                except Exception as e:
+                    # Token refresh failed (expired/revoked) - delete and re-auth
+                    print(f"⚠️ Gmail token refresh failed: {e}")
+                    print("🗑️ Deleting expired token and requesting fresh login...")
+                    if os.path.exists("config/gmail_token.json"):
+                        os.remove("config/gmail_token.json")
+                    creds = None
+
+            if not creds or not creds.valid:
+                # Need fresh authentication
                 if not os.path.exists("config/gmail_credentials.json"):
                     print("ERROR: config/gmail_credentials.json not found!")
                     print("Please set up Gmail API credentials first.")
                     return None
 
+                if not ALLOW_BROWSER_AUTH:
+                    raise RuntimeError(
+                        "Gmail token missing/invalid and browser-based login is disabled on server. "
+                        "Generate config/gmail_token.json on a machine with a browser and upload it."
+                    )
+
+                print("🔐 Opening browser for Gmail authentication...")
                 flow = InstalledAppFlow.from_client_secrets_file(
                     "config/gmail_credentials.json", SCOPES
                 )
@@ -45,6 +63,7 @@ class GmailOTPReader:
 
             with open("config/gmail_token.json", "w") as token:
                 token.write(creds.to_json())
+            print("✅ Gmail token saved")
 
         return build("gmail", "v1", credentials=creds)
 
@@ -201,6 +220,22 @@ class GmailOTPReader:
                     return otp
 
         return None
+
+
+# Standalone function for easy import
+def get_latest_otp(sender_filter="@forward-sms.com", max_age_seconds=1800):
+    """
+    Standalone function to get latest OTP from Gmail.
+    Args:
+        sender_filter: Email sender pattern (default: '@forward-sms.com')
+        max_age_seconds: Maximum time to wait for OTP in seconds (default: 1800 = 30 minutes)
+    Returns:
+        OTP code as string, or None if not found
+    """
+    reader = GmailOTPReader()
+    return reader.get_latest_otp(
+        sender_filter=sender_filter, wait_seconds=60, max_wait=max_age_seconds
+    )
 
 
 # Test function
