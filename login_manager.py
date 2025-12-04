@@ -1,5 +1,5 @@
 """
-login_manager.py - Login with Telegram OTP and Gmail Fallback
+login_manager.py - Simplified login with session cache
 """
 
 import json
@@ -8,10 +8,8 @@ import time
 
 from playwright.async_api import async_playwright
 
-from gmail_otp_reader import get_latest_otp as get_gmail_otp
-
-# Import BOTH readers with alias names to avoid conflict
-from telegram_otp_reader import get_latest_otp as get_telegram_otp
+# CHANGED: Import from your existing telegram reader
+from telegram_otp_reader import get_latest_otp
 
 LOGIN_URL = "https://dealer.unifi.com.my/esales/login"
 HISTORY_URL = "https://dealer.unifi.com.my/esales/retailHistory"
@@ -70,8 +68,8 @@ async def load_session(context):
             await page.evaluate(
                 "() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) { /* ignore */ } }"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Skipped storage clear: {e}")
         finally:
             await page.close()
 
@@ -147,55 +145,50 @@ async def login_and_get_context(username: str, password: str):
     await page.fill("#login-form_staffCode", username)
     await page.fill("#login-form_password", password)
 
+    # --- NEW: Select OTP Channel (SMS) ---
+    print("Selecting OTP Channel (SMS)...")
+    try:
+        # The input has opacity:0, so we must use force=True to click it
+        await page.click("#login-form_channel", force=True)
+        await page.wait_for_timeout(1000)  # Wait for dropdown animation
+
+        # Select 'SMS' from the dropdown list
+        await page.click("div.ant-select-item-option-content:has-text('SMS')")
+        print("✅ Selected SMS channel")
+        await page.wait_for_timeout(500)
+    except Exception as e:
+        print(f"⚠️ Error selecting OTP channel (continuing anyway): {e}")
+    # -------------------------------------
+
     # Accept checkboxes and request OTP
     await page.locator('span.ant-checkbox input[type="checkbox"]').nth(0).check()
     await page.locator('span.ant-checkbox input[type="checkbox"]').nth(1).check()
     await page.click("text=GET")
 
-    # === HYBRID OTP LOGIC ===
-    print("📨 OTP Requested. Attempting to fetch code...")
+    print("Waiting for OTP from Telegram...")
 
-    otp = None
+    # CHANGED: 'await' added because your telegram_otp_reader.py is async
+    otp = await get_latest_otp()
 
-    # 1. Try Telegram First (Wait max 120s)
-    print("🔹 Primary: Listening to Telegram...")
-    try:
-        otp = await get_telegram_otp(max_wait=120)  # <--- NEW (Async with 'await')
-    except Exception as e:
-        print(f"⚠️ Telegram reader error: {e}")
+    if otp:
+        print(f"Using OTP: {otp}")
+        await page.fill("input#login-form_smsCode", otp)
+        await page.click('button:has-text("Sign In")')
 
-    # 2. If Telegram failed, try Gmail Fallback (Wait max 180s)
-    if not otp:
-        print("🔸 Fallback: Telegram timed out. Checking Gmail...")
-        try:
-            # Note: Gmail reader uses 'max_age_seconds' for wait time
-            otp = get_gmail_otp(max_age_seconds=180)
-        except Exception as e:
-            print(f"⚠️ Gmail reader error: {e}")
+        print("Sign In clicked, waiting for dashboard...")
+        await page.wait_for_timeout(5000)
 
-    # 3. If both failed
-    if not otp:
+        print("Navigating to Retail History...")
+        await page.goto(HISTORY_URL, wait_until="networkidle")
+        await page.wait_for_timeout(3000)
+
+        # Wait for app to initialize
+        print("Waiting for app initialization...")
+        await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.wait_for_timeout(2000)
+
+        await save_session(context)
+        return browser, context, pw, page
+    else:
         await browser.close()
-        raise RuntimeError(
-            "❌ CRITICAL: Failed to receive OTP from both Telegram and Gmail."
-        )
-
-    print(f"✅ Using OTP: {otp}")
-    await page.fill("input#login-form_smsCode", otp)
-
-    await page.click('button:has-text("Sign In")')
-    print("Sign In clicked, waiting for dashboard...")
-    await page.wait_for_timeout(5000)
-
-    print("Navigating to Retail History...")
-    await page.goto(HISTORY_URL, wait_until="networkidle")
-    await page.wait_for_timeout(3000)
-    print("On Retail History page")
-
-    # Wait for app to initialize
-    print("Waiting for app initialization...")
-    await page.wait_for_load_state("networkidle", timeout=30000)
-    await page.wait_for_timeout(2000)
-
-    await save_session(context)
-    return browser, context, pw, page
+        raise RuntimeError("Failed to retrieve OTP from Telegram")

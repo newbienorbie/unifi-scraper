@@ -833,23 +833,6 @@ async def scrape_orders_month(
                             address = installation_info.get("displayAddress") or ""
 
                             if not address:
-                                # Look into orderItemList → offerInstList → attrValueList (EXP_INSTALL_ADDRESS_FULL_NAME)
-                                for item in order_items:
-                                    for inst in item.get("offerInstList", []) or []:
-                                        for av in inst.get("attrValueList", []) or []:
-                                            if av.get(
-                                                "attrCode"
-                                            ) == "EXP_INSTALL_ADDRESS_FULL_NAME" and av.get(
-                                                "value"
-                                            ):
-                                                address = av["value"]
-                                                break
-                                        if address:
-                                            break
-                                    if address:
-                                        break
-
-                            if not address:
                                 # Fallbacks from custInfo
                                 address = (
                                     cust_info.get("fullAddress")
