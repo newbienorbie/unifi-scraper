@@ -9,6 +9,7 @@ import os
 from datetime import datetime, time
 from typing import Dict, List, Optional, Tuple
 
+from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from date_utils import month_range_yyyymmddhhmmss, standardize_date
@@ -34,6 +35,54 @@ def format_datetime(datetime_str):
         return dt.strftime("%d %b %Y %H:%M")
     except:
         return datetime_str
+
+
+async def close_blocking_popup(page: Page):
+    """Checks for and closes blocking modals using multiple strategies."""
+    try:
+        # Check if a modal wrapper is visible
+        modal_wrap = page.locator(".ant-modal-wrap")
+        # We use .first because sometimes multiple wrappers exist in the DOM (even if hidden)
+        if await modal_wrap.count() > 0 and await modal_wrap.first.is_visible():
+            print("🛡️ Blocking modal detected. Attempting to close...")
+
+            # Strategy 1: The specific "Later" button (Your known case)
+            later_btn = page.locator('button.ant-btn:has-text("Later")')
+            if await later_btn.count() > 0 and await later_btn.first.is_visible():
+                print("  - ✅ Found 'Later' button. Clicking it...")
+                await later_btn.first.click()
+                await page.wait_for_timeout(1500)
+                return
+
+            # Strategy 2: The standard Ant Design "X" close icon
+            # It usually has the class .ant-modal-close or .ant-modal-close-x
+            close_icon = page.locator(".ant-modal-close")
+            if await close_icon.count() > 0 and await close_icon.first.is_visible():
+                print("  - ❎ Found 'X' close icon. Clicking it...")
+                await close_icon.first.click()
+                await page.wait_for_timeout(1000)
+                return
+
+            # Strategy 3: Generic "Cancel" or "Close" text buttons
+            cancel_btn = page.locator(
+                'button.ant-btn:has-text("Cancel"), button.ant-btn:has-text("Close")'
+            )
+            if await cancel_btn.count() > 0 and await cancel_btn.first.is_visible():
+                print("  - 🚫 Found Cancel/Close button. Clicking it...")
+                await cancel_btn.first.click()
+                await page.wait_for_timeout(1000)
+                return
+
+            # Strategy 4: Click the background mask (The dark overlay)
+            # This works if 'maskClosable' is enabled
+            print("  - 🖱️ Clicking background mask (0,0)...")
+            await page.mouse.click(1, 1)  # Click top-left corner of screen
+            await page.wait_for_timeout(1000)
+        else:
+            print("  - No blocking popups found.")
+
+    except Exception as e:
+        print(f"  - ⚠️ Error while trying to close popup: {e}")
 
 
 def parse_ui_date(date_str):
@@ -125,81 +174,89 @@ def parse_last_synced(last_synced_str: str):
 
 
 async def click_and_select_all_agents(page) -> int:
-    """Click Filter, expand Created by, select all agents"""
+    """Click Filter, expand Created by, select all agents with pagination support"""
     print("\n🎯 Selecting agents from UI...")
 
     await page.click('button.operateBtn___13GXb:has-text("Filter")', timeout=8000)
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(5000)
 
-    # Expand "Created by"
+    # Expand "Created by" section
     print("  📂 Expanding 'Created by' section...")
-    expanded = False
-
     try:
         await page.evaluate(
             '() => document.querySelector("span.icon-ic_nav_expand").click()'
         )
         await page.wait_for_timeout(1500)
-        expanded = True
-        print("  ✅ Expanded (JS click)")
     except:
-        try:
-            await page.click("span.icon-ic_nav_expand", force=True, timeout=5000)
-            await page.wait_for_timeout(1500)
-            expanded = True
-            print("  ✅ Expanded (force click)")
-        except:
-            print("  ⚠️ Could not expand")
+        await page.click("span.icon-ic_nav_expand", force=True, timeout=5000)
+        await page.wait_for_timeout(1500)
 
     # Open channel modal
     print("  🖼️ Opening channel selection modal...")
-    modal_opened = False
-
     try:
         await page.click('img[src*="chooseChannel"]', timeout=5000)
         await page.wait_for_timeout(2000)
-        modal_opened = True
-        print("  ✅ Modal opened")
     except:
-        try:
-            await page.click('img[alt*="channel"]', timeout=3000)
-            await page.wait_for_timeout(2000)
-            modal_opened = True
-            print("  ✅ Modal opened (alt)")
-        except:
-            raise RuntimeError("Could not open channel modal")
-
-    # Set 50/page in modal
-    try:
-        await page.click('.ant-select-selection--single[role="combobox"]', timeout=5000)
-        await page.wait_for_timeout(1500)
-        await page.click(
-            '.ant-select-dropdown-menu-item:has-text("50 / page")', timeout=5000
-        )
+        await page.click('img[alt*="channel"]', timeout=3000)
         await page.wait_for_timeout(2000)
-    except:
-        pass
 
-    # Select all agents
-    await page.wait_for_selector("tr.ant-table-row[data-row-key]", timeout=10000)
-    channel_rows = await page.locator("tr.ant-table-row[data-row-key]").all()
-    print(f"  📋 Found {len(channel_rows)} agents")
+    # Set 50/page in modal to minimize clicking "Next"
+    try:
+        # Targeting the dropdown specifically inside the modal
+        modal_dropdown = page.locator(".ant-modal-body .ant-select-selection--single")
+        if await modal_dropdown.count() > 0:
+            await modal_dropdown.first.click()
+            await page.wait_for_timeout(1000)
+            await page.click('.ant-select-dropdown-menu-item:has-text("50 / page")')
+            await page.wait_for_timeout(2000)
+    except Exception as e:
+        print(f"  ⚠️ Could not set modal pagination: {e}")
 
-    for row in channel_rows:
-        try:
-            await row.click()
-            await page.wait_for_timeout(100)
-        except:
-            pass
+    total_selected = 0
+    page_num = 1
 
-    print(f"  ✅ Selected {len(channel_rows)} agents")
+    while True:
+        # Wait for table rows in the modal
+        await page.wait_for_selector(
+            ".ant-modal-body tr.ant-table-row[data-row-key]", timeout=10000
+        )
+        channel_rows = await page.locator(
+            ".ant-modal-body tr.ant-table-row[data-row-key]"
+        ).all()
 
+        print(f"  📋 Page {page_num}: Selecting {len(channel_rows)} agents...")
+
+        for row in channel_rows:
+            try:
+                # We check if it's already selected by looking for a class or checkbox state if applicable
+                # but clicking usually toggles or selects in this UI
+                await row.click()
+                total_selected += 1
+                await page.wait_for_timeout(50)
+            except:
+                pass
+
+        # Check for Pagination inside the modal
+        next_btn = page.locator(".ant-modal-body li.ant-pagination-next")
+
+        # If the button doesn't exist or is marked as 'disabled'
+        is_disabled = await next_btn.get_attribute("aria-disabled")
+        if await next_btn.count() == 0 or is_disabled == "true":
+            print(f"  ✅ Finished selecting all {total_selected} agents.")
+            break
+
+        print(f"  ➡️ Moving to next page of agents...")
+        await next_btn.click()
+        await page.wait_for_timeout(3000)  # Wait for table to refresh
+        page_num += 1
+
+    # Click the final Select button to confirm
     await page.click(
         'button:has-text("Select"):not(:has-text("Select All"))', timeout=5000
     )
     await page.wait_for_timeout(2000)
 
-    return len(channel_rows)
+    return total_selected
 
 
 async def check_existing_orders_with_dates(
@@ -320,8 +377,8 @@ async def scrape_orders_month(
         # Navigate to History
         print("\n📑 Navigating to History tab...")
         try:
-            await page.click('div.item___1xee2:has-text("History")', timeout=5000)
-            await page.wait_for_timeout(2000)
+            await page.click('div.item___1xee2:has-text("History")', timeout=10000)
+            await page.wait_for_timeout(10000)
         except:
             pass
 
@@ -329,11 +386,13 @@ async def scrape_orders_month(
         try:
             print(f"🗓️ Setting month to {month_text} {year}...")
 
+            await close_blocking_popup(page)
+
             # Click to open date picker
             await page.click(
                 ".ant-picker.select___38REx .ant-picker-input", timeout=5000
             )
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(5000)
 
             # Navigate to correct year
             current_year = datetime.now().year
@@ -855,15 +914,32 @@ async def scrape_orders_month(
                             # Package
                             order_items = data.get("orderItemList", []) or []
                             package = ""
+                            broadband_package = ""
+
+                            # 1. Prioritize Main Offer Type "B" (Bundle)
+                            # This is typically the main internet package (e.g., Unifi Home 500Mbps)
                             for item in order_items:
-                                offer_name = (
-                                    item.get("mainOfferName")
-                                    or item.get("offerName")
-                                    or ""
-                                )
-                                if offer_name:
-                                    package = offer_name
-                                    break
+                                if item.get("mainOfferType") == "B":
+                                    broadband_package = (
+                                        item.get("mainOfferName")
+                                        or item.get("offerName")
+                                        or ""
+                                    )
+                                    if broadband_package:
+                                        package = broadband_package
+                                        break
+
+                            # 2. Fallback to the first main offer name if no Bundle is found
+                            if not package:
+                                for item in order_items:
+                                    offer_name = (
+                                        item.get("mainOfferName")
+                                        or item.get("offerName")
+                                        or ""
+                                    )
+                                    if offer_name:
+                                        package = offer_name
+                                        break
 
                             # Prefer values from custInfo, fall back to partyCertList if needed
                             cert_number = (

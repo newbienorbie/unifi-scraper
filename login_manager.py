@@ -176,11 +176,25 @@ async def login_and_get_context(username: str, password: str):
         await page.click('button:has-text("Sign In")')
 
         print("Sign In clicked, waiting for dashboard...")
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(10000)
 
         print("Navigating to Retail History...")
         await page.goto(HISTORY_URL, wait_until="networkidle")
         await page.wait_for_timeout(3000)
+
+        # CHECK POPUP SECOND (It likely appears here)
+        # ---------------------------------------------------------
+        try:
+            print("Checking for 'Later' popup on History page...")
+            later_btn = page.locator('button.ant-btn:has-text("Later")')
+            if await later_btn.is_visible(timeout=3000):
+                print("✅ Found 'Later' popup. Clicking it...")
+                await later_btn.click()
+                await page.wait_for_timeout(1000)
+            else:
+                print("ℹ️ No 'Later' popup appeared.")
+        except Exception:
+            pass
 
         # Wait for app to initialize
         print("Waiting for app initialization...")

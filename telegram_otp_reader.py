@@ -7,6 +7,7 @@ Async-native version to fix "Event Loop" errors.
 import asyncio
 import re
 import time
+from datetime import datetime
 
 from telethon import TelegramClient
 
@@ -21,8 +22,11 @@ SESSION_NAME = "sessions/unifi_user_session"
 # =================================================
 
 
-# NOTE: We defined this as 'async' now to share the loop with login_manager
-async def get_latest_otp(wait_seconds=60, max_wait=120):
+async def get_latest_otp(wait_seconds=None, max_wait=1200):
+    """
+    Waits for a NEW OTP.
+    max_wait = 1200 seconds (20 minutes) to handle very slow SMS.
+    """
     print(f"👤 Userbot: Connecting to Telegram...")
 
     # Initialize Client
@@ -33,40 +37,61 @@ async def get_latest_otp(wait_seconds=60, max_wait=120):
 
     print(f"👤 Userbot: Connected! Scanning group {CHAT_ID}...")
 
-    start_time = time.time()
+    # -----------------------------------------------------------
+    # THE FIX: Define a "Cutoff Time"
+    # We only accept messages that arrive AFTER we start looking.
+    # We subtract 15 seconds just in case the PC clock is slightly ahead of Telegram's server.
+    # -----------------------------------------------------------
+    search_start_time = time.time()
+    cutoff_timestamp = search_start_time - 15
+
+    print(f"🕒 Waiting for OTP (timeout: {max_wait/60:.0f} mins)...")
 
     try:
-        while time.time() - start_time < max_wait:
+        while time.time() - search_start_time < max_wait:
             # Get last 10 messages
-            # Userbots can see messages from other Bots (like IFTTT)
             messages = await client.get_messages(CHAT_ID, limit=10)
 
             for message in messages:
-                # Check if message is recent (within last 2 minutes)
-                # Note: message.date is timezone-aware, time.time() is UTC timestamp usually
-                # We compare timestamps to be safe
-                msg_time = message.date.timestamp()
-
-                # Check age (allow 2 mins slack)
-                if (time.time() - msg_time) > 120:
+                if not message.date:
                     continue
 
+                # Get message timestamp (UTC)
+                msg_timestamp = message.date.timestamp()
+
+                # ------------------------------------------------
+                # LOGIC: Is this message OLDER than our start time?
+                # ------------------------------------------------
+                if msg_timestamp < cutoff_timestamp:
+                    # This message existed before we clicked "GET". Ignore it.
+                    continue
+
+                # If we get here, the message is NEW (arrived after we started)
                 text = message.text or ""
                 otp = _extract_otp(text)
 
                 if otp:
-                    print(f"✅ Userbot Found OTP: {otp}")
+                    arrival_time = datetime.fromtimestamp(msg_timestamp).strftime(
+                        "%H:%M:%S"
+                    )
+                    print(
+                        f"✅ Userbot Found NEW OTP: {otp} (Arrived at {arrival_time})"
+                    )
                     return otp
 
-            # Non-blocking sleep
-            await asyncio.sleep(3)
+            # Wait 5 seconds before checking again (save CPU)
+            await asyncio.sleep(5)
+
+            # Optional: Print a dot every 30 seconds to show it's still alive
+            if int(time.time()) % 30 == 0:
+                print(".", end="", flush=True)
 
     except Exception as e:
         print(f"⚠️ Userbot Error: {e}")
     finally:
         await client.disconnect()
 
-    print("❌ Userbot Timeout: No OTP found.")
+    print("\n❌ Userbot Timeout: No NEW OTP received within limit.")
     return None
 
 
