@@ -84,7 +84,7 @@ class GmailOTPReader:
         print(f"Waiting for OTP email from {sender_filter}...")
         print(f"Will check for up to {max_wait} seconds (timeout for delays)...")
 
-        start_time = time.time()
+        start_time = time.time() - 60
         check_count = 0
 
         while time.time() - start_time < max_wait:
@@ -92,7 +92,7 @@ class GmailOTPReader:
                 check_count += 1
 
                 # Search for forwarded SMS from any forward-sms.com mailer
-                query = f"from:({sender_filter}) subject:(Forward SMS) newer_than:2m"
+                query = f"from:{sender_filter} newer_than:5m"
 
                 results = (
                     self.service.users()
@@ -174,21 +174,36 @@ class GmailOTPReader:
         return ""
 
     def _get_message_body(self, message):
-        """Extract text from email message"""
-        try:
-            # Handle multipart messages
-            if "parts" in message["payload"]:
-                parts = message["payload"]["parts"]
-                for part in parts:
-                    if part["mimeType"] == "text/plain":
-                        data = part["body"].get("data", "")
-                        if data:
-                            return base64.urlsafe_b64decode(data).decode(
+        """Extract text from email message (handles HTML and nested parts)"""
+
+        def get_text_from_parts(parts):
+            text = ""
+            for part in parts:
+                mime_type = part.get("mimeType", "")
+                # Grab BOTH plain text AND HTML text
+                if mime_type in ["text/plain", "text/html"]:
+                    data = part.get("body", {}).get("data", "")
+                    if data:
+                        text += (
+                            base64.urlsafe_b64decode(data).decode(
                                 "utf-8", errors="ignore"
                             )
+                            + " "
+                        )
+                # If there are nested parts, dig deeper
+                elif "parts" in part:
+                    text += get_text_from_parts(part["parts"])
+            return text
+
+        try:
+            payload = message.get("payload", {})
+
+            # Handle multipart messages (including nested ones)
+            if "parts" in payload:
+                return get_text_from_parts(payload["parts"])
 
             # Handle simple messages
-            data = message["payload"]["body"].get("data", "")
+            data = payload.get("body", {}).get("data", "")
             if data:
                 return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
 
@@ -198,21 +213,21 @@ class GmailOTPReader:
         return ""
 
     def _extract_otp(self, text):
-        """
-        Extract OTP code from email text
-        Handles format: "Unifi: Your OTP is 641776"
-        """
-        # Specific pattern for your SMS format
+        """Clean HTML and extract the 6-digit OTP"""
+        import re
+
+        # 1. Strip all HTML tags out so we just have raw text
+        clean_text = re.sub(r"<[^>]+>", " ", text)
+
+        # 2. Extract the OTP
         patterns = [
-            r"OTP is (\d{6})",  # "Your OTP is 641776"
-            r"OTP:\s*(\d{6})",  # "OTP: 641776"
-            r"code is (\d{6})",  # "code is 641776"
-            r"verification code:\s*(\d{6})",
-            r"\b(\d{6})\b",  # Any 6-digit number (last resort)
+            r"proceed\s+(\d{6})",  # Matches "proceed 655631"
+            r"OTP.*?(\d{6})",  # Matches "OTP... 655631"
+            r"\b(\d{6})\b",  # Fallback: Matches ANY standalone 6 digits
         ]
 
         for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
+            match = re.search(pattern, clean_text, re.IGNORECASE)
             if match:
                 otp = match.group(1)
                 # Verify it's actually 6 digits
@@ -223,15 +238,7 @@ class GmailOTPReader:
 
 
 # Standalone function for easy import
-def get_latest_otp(sender_filter="@forward-sms.com", max_age_seconds=1800):
-    """
-    Standalone function to get latest OTP from Gmail.
-    Args:
-        sender_filter: Email sender pattern (default: '@forward-sms.com')
-        max_age_seconds: Maximum time to wait for OTP in seconds (default: 1800 = 30 minutes)
-    Returns:
-        OTP code as string, or None if not found
-    """
+def get_latest_otp(sender_filter="@unifi.com.my", max_age_seconds=1800):
     reader = GmailOTPReader()
     return reader.get_latest_otp(
         sender_filter=sender_filter, wait_seconds=60, max_wait=max_age_seconds

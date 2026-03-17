@@ -261,19 +261,31 @@ async def click_and_select_all_agents(page) -> int:
 
 async def check_existing_orders_with_dates(
     ws,
-) -> Tuple[Dict[str, datetime], Dict[str, int]]:
+) -> Tuple[Dict[str, datetime], Dict[str, int], set]:
     """
-    Check Google Sheet for existing orders and their Last Synced dates
+    Check Google Sheet for existing orders, their dates, and MISSING DATA.
     Returns:
         - complete_orders: {order_id: last_synced_datetime}
         - incomplete_orders: {order_id: row_index}
+        - orders_missing_org: set(order_ids) -> IDs that have Last Synced but no Org Code
     """
     complete_orders = {}
     incomplete_orders = {}
+    orders_missing_org = set()
 
     try:
         records = ws.get_all_values()
+        if not records:
+            return {}, {}, set()
+
+        headers = records[0]
         print(f"  📊 Checking {len(records)-1} existing orders...")
+
+        # Dynamically find "Org Code" column index (safer than hardcoding)
+        try:
+            org_code_idx = headers.index("Org Code")
+        except ValueError:
+            org_code_idx = -1  # Column not found
 
         for idx, row in enumerate(records[1:], start=2):
             if not row or len(row) == 0:
@@ -283,26 +295,38 @@ async def check_existing_orders_with_dates(
             if not order_number:
                 continue
 
-            # Backward compatibility: Strip quote prefix from old data (pre-fix)
-            # New data doesn't have quotes, but this handles legacy data gracefully
-            # Can be removed once all historical data is confirmed clean
             order_number = order_number.lstrip("'")
 
-            # Order is complete if Last Synced (column 12, index 12) has a value
-            last_synced = row[12].strip() if len(row) > 12 and row[12] else ""
+            # Check if Org Code is missing
+            has_org_code = False
+            if org_code_idx != -1 and len(row) > org_code_idx:
+                if row[org_code_idx].strip():
+                    has_org_code = True
+
+            # Existing Last Synced check (assuming it's still around column 12 or 14)
+            # We try to find "Last Synced" header, fallback to index 12/14 if needed
+            try:
+                ls_idx = headers.index("Last Synced")
+                last_synced = row[ls_idx].strip() if len(row) > ls_idx else ""
+            except ValueError:
+                # Fallback to your original hardcoded index if header missing
+                last_synced = row[12].strip() if len(row) > 12 and row[12] else ""
 
             if last_synced.strip():
                 last_synced_dt = parse_last_synced(last_synced)
-                # Consider it complete regardless; store parsed dt if available, else keep raw string
                 complete_orders[order_number] = last_synced_dt or last_synced.strip()
+
+                # If it's synced but missing Org Code, mark for rescrape
+                if not has_org_code:
+                    orders_missing_org.add(order_number)
             else:
                 incomplete_orders[order_number] = idx
 
-        return complete_orders, incomplete_orders
+        return complete_orders, incomplete_orders, orders_missing_org
 
     except Exception as e:
         print(f"⚠️ Error checking orders: {e}")
-        return {}, {}
+        return {}, {}, set()
 
 
 def should_rescrape_order(
@@ -492,12 +516,16 @@ async def scrape_orders_month(
         # Get existing orders with their last synced dates
         if output_format == "sheets":
             print("\n🔍 Checking existing data with date comparison...")
-            complete_orders, incomplete_orders = await check_existing_orders_with_dates(
-                ws
+            complete_orders, incomplete_orders, orders_missing_org = (
+                await check_existing_orders_with_dates(ws)
             )
 
             if complete_orders:
                 print(f"  ✅ {len(complete_orders)} orders with sync dates")
+            if orders_missing_org:
+                print(
+                    f"  ⚠️ {len(orders_missing_org)} orders missing Org Code (will rescrape)"
+                )
             if incomplete_orders:
                 print(f"  🔄 {len(incomplete_orders)} incomplete orders")
         else:
@@ -613,6 +641,7 @@ async def scrape_orders_month(
 
             if "json" not in captured:
                 print(f"⚠️ No getCeeOrderDetail JSON captured for {order_id}")
+
             return captured.get("json", {}) or {}
 
         # Start scraping with crash-safe error handling
@@ -724,32 +753,38 @@ async def scrape_orders_month(
                             )
                             updated_date = standardize_date(raw_updated)
 
+                            org_code = (
+                                (await cells[9].text_content()).strip()
+                                if len(cells) > 9
+                                else ""
+                            )
+                            org_name = (
+                                (await cells[10].text_content()).strip()
+                                if len(cells) > 10
+                                else ""
+                            )
+
                             # Check if order should be skipped (applies to BOTH modes now)
                             should_skip = False
-                            skip_reason = ""
 
-                            # If order has Last Synced, skip it in BOTH modes
                             if order_id in complete_orders:
-                                should_skip = True
-                                skip_reason = "already synced"
-                                skipped_count += 1
-
-                                if full_sync:
+                                # CHECK: Is it one of the broken ones missing Org Code?
+                                if order_id in orders_missing_org:
+                                    should_skip = False
                                     print(
-                                        f"  [{row_idx}/{len(order_rows)}] {order_id} ⏭️ (already synced)"
+                                        f"  [{row_idx}/{len(order_rows)}] {order_id} 🛠️ (rescraping missing Org Code)"
                                     )
                                 else:
+                                    should_skip = True
+                                    skipped_count += 1
                                     print(
                                         f"  [{row_idx}/{len(order_rows)}] {order_id} ⏭️ (up-to-date)"
                                     )
-
                             else:
-                                # Per-run dedupe (frozen page safety)
+                                # Only scrape if it is genuinely NEW
                                 if order_id in seen_ids:
                                     continue
                                 seen_ids.add(order_id)
-
-                                # New order - needs scraping
                                 print(
                                     f"  [{row_idx}/{len(order_rows)}] {order_id} ✨ (new)\n",
                                     end=" ",
@@ -857,6 +892,60 @@ async def scrape_orders_month(
                                         return item.get("value") or ""
                                 return ""
 
+                            # --- MOVED UP: Package Logic (Needed for Company Name check) ---
+                            order_items = data.get("orderItemList", []) or []
+                            package = ""
+                            broadband_package = ""
+
+                            # 1. Prioritize Main Offer Type "B" (Bundle)
+                            for item in order_items:
+                                if item.get("mainOfferType") == "B":
+                                    broadband_package = (
+                                        item.get("mainOfferName")
+                                        or item.get("offerName")
+                                        or ""
+                                    )
+                                    if broadband_package:
+                                        package = broadband_package
+                                        break
+
+                            # 2. Fallback to the first main offer name if no Bundle is found
+                            if not package:
+                                for item in order_items:
+                                    offer_name = (
+                                        item.get("mainOfferName")
+                                        or item.get("offerName")
+                                        or ""
+                                    )
+                                    if offer_name:
+                                        package = offer_name
+                                        break
+
+                            # --- NEW: Company Name Logic ---
+                            company_name = ""
+                            # If package contains "biz" (case insensitive), capture the Company Name
+                            if "biz" in package.lower():
+                                company_name = cust_info.get("custName", "")
+
+                            # --- 🚀 NEW: Device Name Logic ---
+                            device_name = ""
+                            if "with device" in package.lower():
+                                for item in order_items:
+                                    for offer in item.get("offerInstList", []):
+                                        # Look for the SMART_DEVICE tag in the attributes
+                                        for attr in offer.get("attrValueList", []):
+                                            if (
+                                                attr.get("attrCode")
+                                                == "TM_ADDITIONAL_OFFER_CATG"
+                                                and attr.get("value") == "SMART_DEVICE"
+                                            ):
+                                                device_name = offer.get("offerName", "")
+                                                break
+                                        if device_name:
+                                            break
+                                    if device_name:
+                                        break
+
                             # Name: prefer installation contact name, fall back to customer name
                             name = (
                                 contact_dto.get("contactName")
@@ -911,36 +1000,6 @@ async def scrape_orders_month(
                             else:
                                 appointment_date = ""
 
-                            # Package
-                            order_items = data.get("orderItemList", []) or []
-                            package = ""
-                            broadband_package = ""
-
-                            # 1. Prioritize Main Offer Type "B" (Bundle)
-                            # This is typically the main internet package (e.g., Unifi Home 500Mbps)
-                            for item in order_items:
-                                if item.get("mainOfferType") == "B":
-                                    broadband_package = (
-                                        item.get("mainOfferName")
-                                        or item.get("offerName")
-                                        or ""
-                                    )
-                                    if broadband_package:
-                                        package = broadband_package
-                                        break
-
-                            # 2. Fallback to the first main offer name if no Bundle is found
-                            if not package:
-                                for item in order_items:
-                                    offer_name = (
-                                        item.get("mainOfferName")
-                                        or item.get("offerName")
-                                        or ""
-                                    )
-                                    if offer_name:
-                                        package = offer_name
-                                        break
-
                             # Prefer values from custInfo, fall back to partyCertList if needed
                             cert_number = (
                                 cust_info.get("icNbr")
@@ -986,12 +1045,16 @@ async def scrape_orders_month(
                                 "Order Status": order_status,
                                 "Created Date": created_date,
                                 "Updated Date": updated_date,
+                                "Org Code": org_code,
+                                "Organization Name": org_name,
                                 "Name": name,
+                                "Company Name": company_name,  # <--- NEW FIELD
                                 "Email": email,
                                 "Phone Number": phone_number,
                                 "Appointment Date": appointment_date,
                                 "Address": address,
                                 "Package": package,
+                                "Device": device_name,
                                 "IC Number": ic_number,
                                 "Creator": creator,
                                 "Last Synced": datetime.now().isoformat(),

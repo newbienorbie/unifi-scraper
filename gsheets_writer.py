@@ -6,17 +6,22 @@ from typing import Dict, List
 import gspread
 from gspread.utils import rowcol_to_a1
 
+# UPDATED HEADERS with Org Code and Organization Name
 HEADERS = [
     "Order Number",
     "Order Status",
     "Created Date",
     "Updated Date",
+    "Org Code",
+    "Organization Name",
     "Name",
+    "Company Name",
     "Email",
     "Phone Number",
     "Appointment Date",
     "Address",
     "Package",
+    "Device",
     "IC Number",
     "Creator",
     "Last Synced",
@@ -172,8 +177,8 @@ def ensure_tab(spread, title: str):
     # ensure headers present
     first = ws.row_values(1)
     if first != HEADERS:
-        ws.resize(1)  # delete old rows if misaligned
-        ws.update([HEADERS])
+        # Update headers if they don't match (e.g. adding new columns)
+        ws.update([HEADERS], "A1")
         # Format ONLY header row: bold text
         ws.format("1:1", {"textFormat": {"bold": True}, "horizontalAlignment": "LEFT"})
 
@@ -240,7 +245,16 @@ def upsert_rows(ws, rows: List[Dict[str, str]]):
 
         if key in index:
             row_num = index[key]
-            rng = f"A{row_num}:{rowcol_to_a1(row_num, len(HEADERS)).split(':')[1] if ':' in rowcol_to_a1(row_num, len(HEADERS)) else rowcol_to_a1(row_num, len(HEADERS))}"
+            # Calculate range covering all columns including new ones
+            last_col_char = rowcol_to_a1(row_num, len(HEADERS)).split(":")[0]
+            # rowcol_to_a1 returns like A1, B5. We just need column letters roughly,
+            # but simplest is to just ask gspread for the A1 notation
+            cell_range_a1 = rowcol_to_a1(row_num, len(HEADERS))
+            # If row_num is 5, cell_range_a1 is something like 'O5' (15th col).
+            # We want 'A5:O5'.
+            rng = f"A{row_num}:{cell_range_a1}"
+
+            # Simple fallback if complex calculation fails, but standard gspread utils work well
             updates.append((rng, [values]))
         else:
             to_append.append(values)
@@ -438,27 +452,3 @@ def sort_all_month_tabs(spread, descending=True):
 
     except Exception as e:
         print(f"⚠️ Error in sort_all_month_tabs: {e}")
-
-
-if __name__ == "__main__":
-    # Test the month tab functionality
-    try:
-        spread = open_sheet()
-
-        # Test today's tab
-        tab = today_tab_title()
-        print(f"Today's tab: {tab}")
-
-        # Test month tab with year
-        tab_with_year = month_tab_title("Oct", 2025)
-        print(f"Month with year: {tab_with_year}")
-
-        # Get and sort all month tabs
-        all_tabs = get_all_month_tabs(spread)
-        print(f"All month tabs: {all_tabs}")
-
-        # Ensure tabs are sorted
-        ensure_tabs_sorted_by_month(spread)
-
-    except Exception as e:
-        print(f"Error: {e}")

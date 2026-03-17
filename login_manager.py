@@ -1,19 +1,116 @@
 """
-login_manager.py - Simplified login with session cache
+login_manager.py - Resilient login with session cache and anti-bot stealth
 """
 
 import json
 import os
+import re
 import time
 
 from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 
-# CHANGED: Import from your existing telegram reader
-from telegram_otp_reader import get_latest_otp
+from gmail_otp_reader import get_latest_otp
 
 LOGIN_URL = "https://dealer.unifi.com.my/esales/login"
 HISTORY_URL = "https://dealer.unifi.com.my/esales/retailHistory"
 SESSION_PATH = "sessions/session_cache.json"
+
+STEALTH_SCRIPT = """
+(function() {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [
+        { name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }
+    ]});
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' });
+    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+    Object.defineProperty(window, 'outerWidth',  { get: () => 1280 });
+    Object.defineProperty(window, 'outerHeight', { get: () => 800 });
+    Object.defineProperty(window, 'innerWidth',  { get: () => 1280 });
+    Object.defineProperty(window, 'innerHeight', { get: () => 800 });
+
+    window.location.reload = function() {
+        console.warn('[STEALTH] Blocked location.reload()');
+    };
+
+    function noop() { return { start: noop, stop: noop }; }
+    try {
+        Object.defineProperty(window, 'DisableDevtool', {
+            get: () => noop, set: () => {}, configurable: false
+        });
+    } catch(e) { window.DisableDevtool = noop; }
+
+    const _realSetInterval = window.setInterval;
+    window.setInterval = function(fn, delay) {
+        return _realSetInterval(function() {
+            try { fn.apply(this, arguments); } catch(e) {}
+        }, delay);
+    };
+    const _realSetTimeout = window.setTimeout;
+    window.setTimeout = function(fn, delay) {
+        return _realSetTimeout(function() {
+            try { fn.apply(this, arguments); } catch(e) {}
+        }, delay);
+    };
+
+    const BLOCK = ['no-devtool', 'disable-devtool'];
+    function isBlocked(url) {
+        return BLOCK.some(p => String(url || '').toLowerCase().includes(p));
+    }
+    const _assign  = window.location.assign.bind(window.location);
+    const _replace = window.location.replace.bind(window.location);
+    window.location.assign  = function(url) { if (isBlocked(url)) return; return _assign(url); };
+    window.location.replace = function(url) { if (isBlocked(url)) return; return _replace(url); };
+    try {
+        Object.defineProperty(window.location, 'href', {
+            get: () => window.location.toString(),
+            set: function(val) { if (isBlocked(val)) return; _assign(val); }
+        });
+    } catch(e) {}
+    const _push     = history.pushState.bind(history);
+    const _replace2 = history.replaceState.bind(history);
+    history.pushState    = function(s,t,u) { if (isBlocked(u)) return; return _push(s,t,u); };
+    history.replaceState = function(s,t,u) { if (isBlocked(u)) return; return _replace2(s,t,u); };
+
+    ['_phantom','__phantom','callPhantom','_selenium','awesomium'].forEach(k => {
+        try { Object.defineProperty(window, k, { get: () => undefined }); } catch(e) {}
+    });
+})();
+"""
+
+
+def _patch_script(body: str, url: str) -> str:
+    original = body
+    fname = url.split("/")[-1]
+
+    # PRIMARY: kill Hy()({...ondevtoolopen:function(){...}}) — confirmed pattern
+    body = re.sub(
+        r"Hy\(\)\(\{[^}]*ondevtoolopen:function\(\)\{[^}]*\}\}\)",
+        "void 0/* DisableDevtool removed */",
+        body,
+    )
+
+    # SECONDARY: kill Vy wrapper function body
+    body = re.sub(
+        r"(,Vy=function\(\)\{)try\{[^}]+if\([^)]+\)return;Hy[^}]+\}[^}]+\}catch[^}]+\}",
+        r"\1/* devtool detector removed */}",
+        body,
+    )
+
+    # FALLBACK
+    body = body.replace("window.location.reload()", "void 0/* reload blocked */")
+    body = body.replace("location.reload()", "void 0/* reload blocked */")
+    body = body.replace("/esales/no-devtool.html", "/esales/login")
+    body = body.replace('"no-devtool.html"', '"login"')
+    body = body.replace("'no-devtool.html'", "'login'")
+
+    if body != original:
+        print(f"    ↳ Surgically patched: {fname}")
+    else:
+        print(f"    ↳ ⚠️  No pattern matched in: {fname}")
+
+    return body
 
 
 async def _launch_browser_safe():
@@ -24,21 +121,87 @@ async def _launch_browser_safe():
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--max-old-space-size=512",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--start-maximized",
             ],
+            ignore_default_args=["--enable-automation"],
         )
     except Exception as e:
         raise RuntimeError(f"PLAYWRIGHT_BROWSER_LAUNCH_FAILED: {e}") from e
-    context = await browser.new_context()
+
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 800},
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+    )
+
+    await context.add_init_script(STEALTH_SCRIPT)
+    stealth = Stealth()
+    await stealth.apply_stealth_async(context)
+
+    async def block_anti_bot(route):
+        url = route.request.url
+        url_lower = url.lower()
+
+        if any(k in url_lower for k in ["no-devtool", "disable-devtool"]):
+            print(f"🛡️ Blocked URL: {url}")
+            await route.abort()
+            return
+
+        if route.request.resource_type == "script":
+            try:
+                response = await route.fetch()
+                body = await response.text()
+                lower = body.lower()
+
+                if any(
+                    k in lower
+                    for k in [
+                        "no-devtool",
+                        "disabledevtool",
+                        "disable-devtool",
+                        "devtoolsdetector",
+                        "ondevtoolopen",
+                    ]
+                ):
+                    print(f"🛡️ Patching script: {url}")
+                    patched = _patch_script(body, url)
+                    await route.fulfill(
+                        status=response.status,
+                        headers=dict(response.headers),
+                        body=patched,
+                    )
+                    return
+            except Exception as e:
+                print(f"⚠️ Script intercept failed for {url}: {e}")
+
+        await route.continue_()
+
+    await context.route("**/*", block_anti_bot)
+
     page = await context.new_page()
     page.set_default_timeout(45000)
     page.set_default_navigation_timeout(60000)
-    print("[BROWSER] engine=playwright chromium (no channel)")
+
+    async def on_frame_navigated(frame):
+        try:
+            if any(k in frame.url.lower() for k in ["no-devtool", "disable-devtool"]):
+                print(f"⚠️ Frame navigated to blocked page — going back: {frame.url}")
+                await page.go_back()
+        except Exception:
+            pass
+
+    page.on("framenavigated", on_frame_navigated)
+
+    print("[BROWSER] engine=playwright chromium (Headed + Stealth + surgical patch)")
     return pw, browser, context, page
 
 
 async def load_session(context):
-    """Load cached cookies if <1 day old"""
     if not os.path.exists(SESSION_PATH):
         return None
     try:
@@ -60,13 +223,9 @@ async def load_session(context):
     if cookies:
         page = await context.new_page()
         try:
-            await page.goto(
-                "https://dealer.unifi.com.my/esales/login",
-                timeout=30000,
-                wait_until="domcontentloaded",
-            )
+            await page.goto(LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
             await page.evaluate(
-                "() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) { /* ignore */ } }"
+                "() => { try { localStorage.clear(); sessionStorage.clear(); } catch(e) {} }"
             )
         except Exception as e:
             print(f"⚠️ Skipped storage clear: {e}")
@@ -81,13 +240,9 @@ async def load_session(context):
 
 
 async def save_session(context):
-    """Save cookies to disk"""
     os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
     cookies = await context.cookies()
-    payload = {
-        "cookies": cookies,
-        "last_login": time.time(),
-    }
+    payload = {"cookies": cookies, "last_login": time.time()}
     with open(SESSION_PATH, "w") as f:
         json.dump(payload, f)
     print("Session cookies saved")
@@ -96,84 +251,111 @@ async def save_session(context):
 async def login_and_get_context(username: str, password: str):
     pw, browser, context, page = await _launch_browser_safe()
 
-    # Try reuse session
     session = await load_session(context)
     if session:
         try:
             print("Testing cached session...")
-            await page.goto(HISTORY_URL, timeout=30000)
+            await page.goto(HISTORY_URL, timeout=30000, wait_until="domcontentloaded")
             await page.wait_for_timeout(3000)
 
-            current_url = page.url
-
-            if "login" in current_url.lower():
-                print("Redirected to login - session invalid")
+            if (
+                "login" in page.url.lower()
+                or "no-devtool" in page.url.lower()
+                or await page.locator("input#login-form_staffCode").count() > 0
+            ):
+                print("❌ Session invalid - proceeding to fresh login")
             else:
-                login_form_present = (
-                    await page.locator("input#login-form_staffCode").count() > 0
-                )
-                if login_form_present:
-                    print("❌ Login form detected - session invalid")
-                else:
-                    try:
-                        await page.wait_for_selector(
-                            'div.item___1xee2:has-text("History")', timeout=5000
-                        )
-                        await page.click(
-                            'div.item___1xee2:has-text("History")', timeout=3000
-                        )
-                        await page.wait_for_timeout(1000)
-
-                        month_picker = await page.locator(
-                            ".ant-picker.select___38REx"
-                        ).count()
-                        if month_picker > 0:
-                            print("Cached session valid - using it!")
-                            return browser, context, pw, page
-                        else:
-                            print("Month picker not found - session invalid")
-                    except:
-                        print("Cannot interact with History tab - session invalid")
+                try:
+                    await page.locator('text="History"').last.click(timeout=5000)
+                    await page.wait_for_timeout(1000)
+                    if await page.locator(".ant-picker").count() > 0:
+                        print("✅ Cached session valid - using it!")
+                        return browser, context, pw, page
+                except Exception:
+                    pass
         except Exception as e:
             print(f"⚠️ Session test failed: {e}")
 
-    # Fresh login
     print("Opening login page...")
-    await page.goto(LOGIN_URL, timeout=30000)
+    await page.goto(LOGIN_URL, timeout=45000, wait_until="domcontentloaded")
 
-    # Fill credentials
+    if "no-devtool" in page.url.lower():
+        raise RuntimeError("❌ Redirected to no-devtool on login load.")
+
+    await page.wait_for_selector(
+        "#login-form_staffCode", state="visible", timeout=30000
+    )
+    await page.wait_for_timeout(1500)
+
     await page.fill("#login-form_staffCode", username)
     await page.fill("#login-form_password", password)
 
-    # --- NEW: Select OTP Channel (SMS) ---
+    # --- Select OTP Channel (SMS) ---
     print("Selecting OTP Channel (SMS)...")
     try:
-        # The input has opacity:0, so we must use force=True to click it
-        await page.click("#login-form_channel", force=True)
-        await page.wait_for_timeout(1000)  # Wait for dropdown animation
-
-        # Select 'SMS' from the dropdown list
-        await page.click("div.ant-select-item-option-content:has-text('SMS')")
-        print("✅ Selected SMS channel")
-        await page.wait_for_timeout(500)
+        channel_dropdown = page.locator("#login-form_channel")
+        if await channel_dropdown.count() == 0:
+            channel_dropdown = page.locator(".ant-select-selection-item").last
+        await channel_dropdown.click(force=True, timeout=5000)
+        await page.wait_for_timeout(1000)
+        await page.locator(
+            ".ant-select-item-option-content:has-text('Email')"
+        ).first.click(force=True, timeout=5000)
+        print("✅ Selected Email channel")
+        await page.wait_for_timeout(1000)
     except Exception as e:
-        print(f"⚠️ Error selecting OTP channel (continuing anyway): {e}")
-    # -------------------------------------
+        print(f"⚠️ Error selecting OTP channel: {e}")
 
-    # Accept checkboxes and request OTP
-    await page.locator('span.ant-checkbox input[type="checkbox"]').nth(0).check()
-    await page.locator('span.ant-checkbox input[type="checkbox"]').nth(1).check()
-    await page.click("text=GET")
+    # --- Accept Checkboxes ---
+    print("Accepting Terms and Conditions...")
+    try:
+        await page.locator("input#login-form_rememerMe").check(force=True, timeout=3000)
+        await page.locator('.policy___1uV3w input[type="checkbox"]').check(
+            force=True, timeout=3000
+        )
+        await page.wait_for_timeout(1000)
+    except Exception as e:
+        print(f"⚠️ Warning clicking checkboxes: {e}")
 
-    print("Waiting for OTP from Telegram...")
+    # --- Request OTP ---
+    print("Requesting OTP...")
+    try:
+        await page.click("text=GET", timeout=5000)
+        print("✅ Clicked GET button")
+    except Exception as e:
+        print(f"⚠️ Warning clicking GET: {e}")
 
-    # CHANGED: 'await' added because your telegram_otp_reader.py is async
-    otp = await get_latest_otp()
+    # Screenshot to confirm GET was clicked and OTP field appeared
+    os.makedirs("logs", exist_ok=True)
+    await page.wait_for_timeout(2000)
+    await page.screenshot(path="logs/after_get_click.png")
+    print("📸 Screenshot saved to logs/after_get_click.png")
+
+    print("Waiting for OTP from Email...")
+    import asyncio
+
+    # Runs the synchronous Gmail reader in a separate thread so Playwright doesn't freeze
+    otp = await asyncio.to_thread(get_latest_otp)
 
     if otp:
         print(f"Using OTP: {otp}")
-        await page.fill("input#login-form_smsCode", otp)
-        await page.click('button:has-text("Sign In")')
+        try:
+            otp_field = page.locator("input#login-form_smsCode")
+            await otp_field.wait_for(state="visible", timeout=15000)
+            await otp_field.fill(otp, force=True)
+            print("✅ Filled OTP")
+        except Exception as e:
+            os.makedirs("logs", exist_ok=True)
+            await page.screenshot(path="logs/otp_fill_failed.png")
+            raise RuntimeError(
+                f"Could not fill OTP field. Check logs/otp_fill_failed.png. Error: {e}"
+            )
+
+        print("Clicking Sign In...")
+        try:
+            await page.click('button:has-text("Sign In")', force=True, timeout=5000)
+        except Exception:
+            await page.locator('button[type="submit"]').click(force=True)
 
         print("Sign In clicked, waiting for dashboard...")
         await page.wait_for_timeout(10000)
@@ -182,21 +364,15 @@ async def login_and_get_context(username: str, password: str):
         await page.goto(HISTORY_URL, wait_until="networkidle")
         await page.wait_for_timeout(3000)
 
-        # CHECK POPUP SECOND (It likely appears here)
-        # ---------------------------------------------------------
         try:
-            print("Checking for 'Later' popup on History page...")
             later_btn = page.locator('button.ant-btn:has-text("Later")')
             if await later_btn.is_visible(timeout=3000):
                 print("✅ Found 'Later' popup. Clicking it...")
                 await later_btn.click()
                 await page.wait_for_timeout(1000)
-            else:
-                print("ℹ️ No 'Later' popup appeared.")
         except Exception:
             pass
 
-        # Wait for app to initialize
         print("Waiting for app initialization...")
         await page.wait_for_load_state("networkidle", timeout=30000)
         await page.wait_for_timeout(2000)
@@ -205,4 +381,5 @@ async def login_and_get_context(username: str, password: str):
         return browser, context, pw, page
     else:
         await browser.close()
+        raise RuntimeError("Failed to retrieve OTP from Telegram")
         raise RuntimeError("Failed to retrieve OTP from Telegram")
