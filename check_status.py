@@ -1,0 +1,1084 @@
+"""
+check_status.py - Check subscriber status via API (QryCustInfoByParamsEx)
+Navigates to Order Entry once to capture session context, then queries
+each order via direct fetch() calls — no UI clicking per query.
+Writes Status + Status Updated Time back to Google Sheet.
+"""
+
+import re
+from datetime import datetime
+from typing import Dict, List, Tuple
+
+from playwright.async_api import Page
+
+from gsheets_writer import month_tab_title, open_sheet
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
+LOCAL_TZ = ZoneInfo("Asia/Kuala_Lumpur") if ZoneInfo else None
+
+ORDER_ENTRY_URL = "https://dealer.unifi.com.my/esales/crm-TYMH100163"
+API_URL = "https://dealer.unifi.com.my/esales/FishModule/cvbs/callservice.json?service=CallOcsDubboService&serviceName=QryCustInfoByParamsEx"
+
+# Map cert type names (from the sheet IC Number field) to certTypeId values
+CERT_TYPE_ID_MAP = {
+    "MyKad": "1",
+    "Passport": "2",
+    "Police/Army": "3",
+    "Old IC": "4",
+    "Birth Cert": "5",
+    "Business Reg": "8",
+    "Company with Business Registration Number": "8",
+    "Company without Business Registration Number": "9",
+    "Channel Account": "6",
+    "I-KAD": "10",
+    "Internal Division ID": "11",
+    "MyKAS": "12",
+    "Others": "99",
+}
+
+# prodStateName mapping for cleaner output
+PROD_STATE_MAP = {
+    "A": "Active",
+    "S": "Suspended",
+    "T": "Terminated",
+    "P": "Pre-active",
+}
+
+
+def parse_ic_number(ic_field: str) -> Tuple[str, str]:
+    """
+    Parse IC Number field like '960330015853 (MyKad)' into (number, type).
+    Returns (cert_number, cert_type_name) or ('', '') if unparsable.
+    """
+    if not ic_field or not ic_field.strip():
+        return "", ""
+
+    ic_field = ic_field.strip()
+
+    # Match the LAST (...) group as the cert type
+    # Handles cases like "MBPJ.COB.04108.2025(6) (Company with Business Registration Number)"
+    match = re.match(r"^(.+)\s+\(([^)]+)\)\s*$", ic_field)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+
+    clean = ic_field.strip()
+    if clean:
+        return clean, ""
+
+    return "", ""
+
+
+def get_orders_to_check(ws, only_empty: bool = False) -> Tuple[List[Dict], List[int]]:
+    """
+    Read all orders from the worksheet that need status checking.
+    Uses custId for direct qrySubsPageTree queries (no Advanced Query needed).
+    If only_empty=True, only returns orders without a Status value.
+    """
+    orders = []
+    cancelled_rows = []
+    try:
+        records = ws.get_all_values()
+        if not records or len(records) <= 1:
+            return orders, cancelled_rows
+
+        headers = records[0]
+
+        def col_idx(name):
+            try:
+                return headers.index(name)
+            except ValueError:
+                return -1
+
+        idx_order = col_idx("Order Number")
+        idx_order_status = col_idx("Order Status")
+        idx_cust_id = col_idx("Cust ID")
+        idx_status = col_idx("Status")
+
+        if idx_order == -1:
+            print("  Missing Order Number column")
+            return orders, cancelled_rows
+
+        skipped_no_cust_id = []
+        for row_num, row in enumerate(records[1:], start=2):
+            if not row or len(row) <= idx_order:
+                continue
+
+            order_number = row[idx_order].strip().lstrip("'")
+            if not order_number:
+                continue
+
+            # Pad row
+            max_idx = max(idx_order, idx_order_status or 0, idx_cust_id or 0, idx_status or 0)
+            while len(row) <= max_idx:
+                row.append("")
+
+            # Collect cancelled orders to fill with "-" but skip querying
+            if idx_order_status != -1:
+                if row[idx_order_status].strip().lower() == "cancelled":
+                    if idx_status != -1 and not row[idx_status].strip():
+                        cancelled_rows.append(row_num)
+                    continue
+
+            # Skip orders that already have a Status if only_empty mode
+            if only_empty and idx_status != -1:
+                if row[idx_status].strip():
+                    continue
+
+            # Get custId
+            cust_id = row[idx_cust_id].strip() if idx_cust_id != -1 else ""
+
+            if not cust_id:
+                skipped_no_cust_id.append(order_number)
+                continue
+
+            orders.append({
+                "row_index": row_num,
+                "order_number": order_number,
+                "cust_id": cust_id,
+            })
+
+        if skipped_no_cust_id:
+            print(f"  Skipped {len(skipped_no_cust_id)} orders with no Cust ID: {skipped_no_cust_id[:10]}{'...' if len(skipped_no_cust_id) > 10 else ''}")
+        if cancelled_rows:
+            print(f"  {len(cancelled_rows)} cancelled orders to mark with '-'")
+
+        return orders, cancelled_rows
+
+    except Exception as e:
+        print(f"  Error reading orders: {e}")
+        return orders, cancelled_rows
+
+
+async def navigate_to_order_entry(page: Page):
+    """
+    Navigate to Order Entry and open the Advanced Query form.
+    Returns the iframe frame where the form lives.
+    """
+    await page.goto(ORDER_ENTRY_URL, wait_until="networkidle", timeout=90000)
+    await page.wait_for_timeout(10000)
+
+    # Find the iframe containing the form — retry for up to 60s
+    frame = page
+    for attempt in range(6):
+        for f in page.frames:
+            if f == page.main_frame:
+                continue
+            try:
+                if await f.locator("div.js-advanced-query-btn").count() > 0:
+                    frame = f
+                    break
+            except Exception:
+                pass
+        if frame != page:
+            break
+        print(f"  Waiting for iframe to load... (attempt {attempt + 1}/6)")
+        await page.wait_for_timeout(10000)
+
+    # Wait for the >> button
+    try:
+        await frame.wait_for_selector("div.js-advanced-query-btn", state="attached", timeout=30000)
+    except Exception:
+        print("  >> button not found after waiting")
+        await page.wait_for_timeout(15000)
+
+    # Open Advanced Query
+    try:
+        await frame.locator("div.js-advanced-query-btn").first.click(timeout=15000)
+        await page.wait_for_timeout(3000)
+    except Exception as e:
+        print(f"Error opening Advanced Query: {e}")
+
+    return frame
+
+
+REFERER_URL = "https://dealer.unifi.com.my/esales/FishModule/remote.html?crm/modules/pos/orderentry/views/CCEntryView"
+
+
+def build_api_payload(
+    cert_number: str,
+    cert_type: str,
+    cust_name: str,
+) -> Dict:
+    """
+    Build the API payload for QryCustInfoByParamsEx.
+    """
+    cert_type_id = CERT_TYPE_ID_MAP.get(cert_type, "1")
+
+    data = {
+        "certTypeId": cert_type_id,
+        "certNbr": cert_number,
+        "custName": cust_name,
+        "showTerminatedSubs": "false",
+        "zsmart_dubbo_service_name": "QryCustInfoByParamsEx",
+        "zsmart_fish_flag": True,
+        "zsmart_referer_url": REFERER_URL,
+    }
+
+    payload = {
+        "ServiceName": "CallOcsDubboService",
+        "Data": data,
+        "zsmart_origin_menu": None,
+    }
+
+    return payload
+
+
+async def query_subscriber_api(
+    page: Page, iframe_frame, csrf_token: str, cert_number: str, cert_type: str, cust_name: str
+) -> List[Dict]:
+    """
+    Query subscriber status via direct API call from the iframe context.
+    Returns list of subscriber entries from custQueryResult.
+    """
+    payload = build_api_payload(cert_number, cert_type, cust_name)
+    url = API_URL + "&timestamp=" + str(int(datetime.now().timestamp() * 1000))
+
+    # Run fetch from the iframe context (same origin as the API)
+    target = iframe_frame if iframe_frame else page
+
+    try:
+        result = await target.evaluate(
+            """async (args) => {
+                const [url, payload, csrfToken] = args;
+                try {
+                    const resp = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'x-csrf-token': csrfToken,
+                        },
+                        body: JSON.stringify(payload),
+                        credentials: 'include',
+                    });
+                    const data = await resp.json();
+                    return { success: true, data: data };
+                } catch (e) {
+                    return { success: false, error: e.message };
+                }
+            }""",
+            [url, payload, csrf_token],
+        )
+
+        if not result.get("success"):
+            print(f"    API error: {result.get('error')}")
+            return []
+
+        data = result.get("data", {})
+
+        if not data.get("isSuccess") and not data.get("callServiceSuccess"):
+            msg = data.get("Msg") or data.get("message") or data.get("msg") or ""
+            print(f"    API failed: {msg}")
+            # On first failure, dump payload keys for debugging
+            if cert_number == payload.get("certNbr"):
+                print(f"    Payload keys: {list(payload.keys())}")
+                print(f"    Session keys: {list(payload.get('zsmartSession', {}).keys())}")
+            return []
+
+        results = data.get("custQueryResult", []) or []
+
+        # If results have empty prodStateName, try the second API (qrySubsPageTree)
+        if results:
+            has_empty_status = any(not r.get("prodStateName") for r in results)
+            if has_empty_status:
+                # Get custId from first result
+                cust_id = results[0].get("custId", "")
+                if cust_id:
+                    subs_results = await query_subs_page_tree(target, csrf_token, cust_id)
+                    if subs_results:
+                        # Merge: fill empty prodStateName from subsList by matching offerName/subsPlanName
+                        subs_by_offer = {}
+                        for s in subs_results:
+                            key = (s.get("subsPlanName") or s.get("offerName") or "").lower()
+                            if key and s.get("prodStateName"):
+                                subs_by_offer[key] = s.get("prodStateName")
+                        # Also index by a general status (if all are same)
+                        all_states = [s.get("prodStateName") for s in subs_results if s.get("prodStateName")]
+                        general_state = all_states[0] if all_states and len(set(all_states)) == 1 else ""
+
+                        for r in results:
+                            if not r.get("prodStateName"):
+                                offer = (r.get("offerName") or "").lower()
+                                if offer in subs_by_offer:
+                                    r["prodStateName"] = subs_by_offer[offer]
+                                elif general_state:
+                                    r["prodStateName"] = general_state
+
+        return results
+
+    except Exception as e:
+        print(f"    API call error: {e}")
+        return []
+
+
+SUBS_PAGE_TREE_URL = "https://dealer.unifi.com.my/esales/FishModule/crm/api/subs/qrySubsPageTree"
+
+
+async def query_subs_page_tree(target, csrf_token: str, cust_id: str) -> List[Dict]:
+    """
+    Query subscriber page tree by custId to get actual prodStateName.
+    Used as fallback when QryCustInfoByParamsEx returns empty status.
+    """
+    payload = {
+        "requestParam": {
+            "custId": str(cust_id),
+            "PAGE_REQ": {
+                "COUNT_FLAG": "N",
+                "PAGE_MODE": "S",
+                "pageIndex": 1,
+                "pageCount": 50,
+            },
+        }
+    }
+
+    try:
+        result = await target.evaluate(
+            """async (args) => {
+                const [url, payload, csrfToken] = args;
+                try {
+                    const resp = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'x-csrf-token': csrfToken,
+                        },
+                        body: JSON.stringify(payload),
+                        credentials: 'include',
+                    });
+                    const data = await resp.json();
+                    return { success: true, data: data };
+                } catch (e) {
+                    return { success: false, error: e.message };
+                }
+            }""",
+            [SUBS_PAGE_TREE_URL, payload, csrf_token],
+        )
+
+        if not result.get("success"):
+            return []
+
+        data = result.get("data", {})
+        if not data.get("isSuccess"):
+            return []
+
+        return data.get("subsList", []) or []
+
+    except Exception:
+        return []
+
+
+async def query_via_order_detail(target, context, csrf_token: str, order_id: str) -> List[Dict]:
+    """
+    Last resort fallback: open order detail to get custId, then call qrySubsPageTree.
+    Returns subsList entries with prodStateName.
+    """
+    captured = {}
+
+    async def intercept(response):
+        try:
+            if "getCeeOrderDetail" in response.url and response.status == 200:
+                data = await response.json()
+                if isinstance(data, dict) and data.get("data"):
+                    cust_info = data["data"].get("custInfo", {}) or {}
+                    captured["custId"] = cust_info.get("custId", "")
+        except Exception:
+            pass
+
+    p = await context.new_page()
+    p.on("response", intercept)
+
+    try:
+        url = f"https://dealer.unifi.com.my/esales/h5/onBoarding/OrderDetails?custOrderId={order_id}&custOrderNbr={order_id}"
+        await p.goto(url, wait_until="networkidle", timeout=60000)
+
+        for _ in range(20):
+            if "custId" in captured:
+                break
+            await p.wait_for_timeout(500)
+
+        await p.wait_for_timeout(500)
+    except Exception as e:
+        print(f"    Error fetching order detail: {e}")
+    finally:
+        try:
+            await p.close()
+        except Exception:
+            pass
+
+    cust_id = captured.get("custId", "")
+    if not cust_id:
+        return []
+
+    print(f"    Got custId: {cust_id}")
+    subs = await query_subs_page_tree(target, csrf_token, cust_id)
+    return subs
+
+
+def _get_status(entry: Dict) -> str:
+    """Extract status from a result entry. Returns empty string if no status."""
+    return entry.get("prodStateName", "") or PROD_STATE_MAP.get(
+        entry.get("prodState", ""), ""
+    )
+
+
+def match_status_from_api(results: List[Dict], package: str = "") -> Tuple[str, str]:
+    """
+    Find the subscriber status from API results.
+    If any entry has a status, use it — all entries for the same customer
+    typically share the same status.
+    Returns (status, status_date) tuple.
+    """
+    if not results:
+        return "Not Found", ""
+
+    # Just find the first entry with a non-empty status
+    for r in results:
+        status = _get_status(r)
+        if status:
+            # prodStateDate = when the status last changed
+            date = r.get("prodStateDate") or r.get("completedDate") or ""
+            if date:
+                try:
+                    from datetime import datetime as _dt
+                    for fmt in ["%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"]:
+                        try:
+                            dt = _dt.strptime(date, fmt)
+                            date = dt.strftime("%d %b %Y")
+                            break
+                        except ValueError:
+                            continue
+                except Exception:
+                    pass
+            return status, date
+
+    # All entries have empty status
+    return "", ""
+
+
+class StatusBatchWriter:
+    """Collects status updates and flushes them in batches to avoid rate limits."""
+
+    def __init__(self, ws, headers: list, batch_size: int = 25):
+        self.ws = ws
+        self.batch_size = batch_size
+        self.pending = []
+
+        try:
+            self.status_col = headers.index("Status") + 1  # 1-based
+        except ValueError:
+            self.status_col = -1
+
+        try:
+            self.date_col = headers.index("Status Latest Date") + 1
+        except ValueError:
+            self.date_col = -1
+
+        try:
+            self.time_col = headers.index("Status Scrape Date") + 1
+        except ValueError:
+            self.time_col = -1
+
+    def add(self, row_index: int, status: str, status_date: str = ""):
+        if self.status_col == -1:
+            print("    Status column not found in headers")
+            return
+        if not status:
+            status = "-"
+        timestamp = "'" + datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        self.pending.append((row_index, status, status_date, timestamp))
+        if len(self.pending) >= self.batch_size:
+            self.flush()
+
+    def flush(self):
+        if not self.pending or self.status_col == -1:
+            return
+
+        from gspread.utils import rowcol_to_a1
+
+        batch = []
+        for row_index, status, status_date, timestamp in self.pending:
+            batch.append({"range": rowcol_to_a1(row_index, self.status_col), "values": [[status]]})
+            if self.date_col != -1:
+                batch.append({"range": rowcol_to_a1(row_index, self.date_col), "values": [[status_date]]})
+            if self.time_col != -1:
+                batch.append({"range": rowcol_to_a1(row_index, self.time_col), "values": [[timestamp]]})
+
+        try:
+            self.ws.batch_update(batch, value_input_option="USER_ENTERED")
+        except Exception as e:
+            print(f"    Batch write error: {e}")
+
+        self.pending = []
+
+
+### --- PLAN B: UI SCRAPING FALLBACK --- ###
+
+
+# Map cert type names to dropdown option text
+CERT_TYPE_UI_MAP = {
+    "MyKad": "MyKad",
+    "Passport": "Passport",
+    "Police/Army": "Police/Army",
+    "Old IC": "Old IC",
+    "Birth Cert": "Birth Cert",
+    "Business Reg": "Company with Business Registration Number",
+    "Company with Business Registration Number": "Company with Business Registration Number",
+    "Company without Business Registration Number": "Company without Business Registration Nu",
+    "Channel Account": "Channel Account",
+    "I-KAD": "I-KAD",
+    "Internal Division ID": "Internal Division ID",
+    "MyKAS": "MyKAS",
+    "Others": "Others",
+}
+
+
+async def select_id_type_ui(frame, cert_type: str):
+    """Select the ID Type from the dropdown in the Advanced Query form."""
+    if not cert_type:
+        return
+
+    ui_type = CERT_TYPE_UI_MAP.get(cert_type, cert_type)
+
+    try:
+        # Try <select> element first (the dropdown in the Advanced Query form)
+        select_el = frame.locator('select.js-cert-type-id, select[name="certTypeId"]')
+        if await select_el.count() > 0:
+            await select_el.first.select_option(label=ui_type, timeout=5000)
+            print(f"    Selected ID Type: {ui_type}")
+            return
+
+        # Fallback: try clicking the dropdown trigger and selecting from list
+        dropdown = frame.locator(
+            "div.form-group.js-cert-type-id-content span.glyphicon-triangle-bottom"
+        )
+        if await dropdown.count() == 0:
+            dropdown = frame.locator('.js-cert-type-id-content .btn-group .btn')
+
+        await dropdown.first.click(timeout=5000)
+        await frame.wait_for_timeout(1000)
+
+        option = frame.locator(
+            f'a:has-text("{ui_type}"), li:has-text("{ui_type}")'
+        ).first
+        if await option.count() > 0:
+            await option.click(timeout=5000)
+            await frame.wait_for_timeout(500)
+            print(f"    Selected ID Type: {ui_type}")
+        else:
+            print(f"    Could not find ID Type option: {ui_type}")
+
+    except Exception as e:
+        print(f"    Error selecting ID Type: {e}")
+
+
+async def query_subscriber_ui(
+    page: Page, iframe_frame, cert_number: str, cert_type: str, name: str
+) -> List[Dict]:
+    """
+    Plan B: Fill the Advanced Query form via UI and intercept the API response.
+    Returns the custQueryResult list from the intercepted response.
+    iframe_frame: the iframe frame to interact with (or None to auto-detect).
+    form_already_open: if True, skip clicking >> (just fill and query directly).
+    """
+    # Find the iframe if not provided
+    if iframe_frame is None:
+        iframe_frame = page
+        for f in page.frames:
+            if f == page.main_frame:
+                continue
+            if "remote.html" in f.url or "orderentry" in f.url.lower():
+                iframe_frame = f
+                break
+
+    captured = {}
+
+    async def intercept_response(response):
+        try:
+            if (
+                "callservice.json" in response.url
+                and "CallOcsDubboService" in response.url
+                and response.status == 200
+            ):
+                try:
+                    data = await response.json()
+                    if isinstance(data, dict) and "custQueryResult" in data:
+                        captured["results"] = data.get("custQueryResult", [])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    page.on("response", intercept_response)
+
+    for attempt in range(2):
+        try:
+            # Check if form is still open, reopen if needed
+            cert_input = iframe_frame.locator('input[name="certNbr"]')
+            if await cert_input.count() == 0 or not await cert_input.first.is_visible():
+                print(f"    Form not visible, reopening...")
+                try:
+                    await iframe_frame.locator("div.js-advanced-query-btn").first.click(timeout=10000)
+                    await page.wait_for_timeout(3000)
+                except Exception:
+                    pass
+
+            # Select ID Type
+            await select_id_type_ui(iframe_frame, cert_type)
+
+            await iframe_frame.locator('input[name="certNbr"]').fill(cert_number, timeout=10000)
+            await page.wait_for_timeout(300)
+
+            await iframe_frame.locator('input[name="custName"]').fill(name, timeout=10000)
+            await page.wait_for_timeout(300)
+
+            await iframe_frame.locator("button.js-query").click(timeout=10000)
+
+            for _ in range(20):
+                if "results" in captured:
+                    break
+                await page.wait_for_timeout(500)
+
+            await page.wait_for_timeout(1000)
+            break  # success, no need to retry
+
+        except Exception as e:
+            if attempt == 0:
+                print(f"    Attempt 1 failed, retrying: {e}")
+                await page.wait_for_timeout(2000)
+            else:
+                print(f"    Error querying {cert_number}: {e}")
+                captured["error"] = True
+                try:
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+    page.remove_listener("response", intercept_response)
+
+    if captured.get("error"):
+        return None  # Signal that this was an error, not "Not Found"
+
+    return captured.get("results", [])
+
+
+async def check_all_statuses(
+    page: Page,
+    month_text: str,
+    year: int,
+    ws=None,
+    iframe_frame=None,
+    only_empty: bool = False,
+) -> Dict:
+    """
+    Check subscriber statuses via qrySubsPageTree using custId from the sheet.
+    No Advanced Query needed — just direct API calls.
+
+    Args:
+        page: Playwright page (already logged in)
+        month_text: Month name (e.g. 'Jun')
+        year: Year (e.g. 2026)
+        ws: Optional worksheet object. If None, opens the sheet.
+        iframe_frame: iframe frame for API calls (reused across months)
+        only_empty: If True, only check orders without a Status value.
+    """
+    print("\n" + "=" * 70)
+    print(f"SUBSCRIBER STATUS CHECK — {month_text} {year}")
+    print("=" * 70)
+
+    # Open sheet if not provided
+    if ws is None:
+        spread = open_sheet()
+        tab_title = month_tab_title(month_text, year)
+        try:
+            ws = spread.worksheet(tab_title)
+        except Exception:
+            print(f"  Tab '{tab_title}' not found — skipping")
+            return {"total": 0, "checked": 0, "not_found": 0, "errors": 0, "skipped": True}
+        from gsheets_writer import HEADERS
+        first_row = ws.row_values(1)
+        if first_row != HEADERS:
+            ws.update([HEADERS], "A1")
+            print("  Updated sheet headers with new columns")
+        print(f"  Sheet tab: {tab_title}")
+    else:
+        from gsheets_writer import HEADERS
+        first_row = ws.row_values(1)
+        if first_row != HEADERS:
+            ws.update([HEADERS], "A1")
+            print("  Updated sheet headers with new columns")
+
+    # Get orders to check
+    orders, cancelled_rows = get_orders_to_check(ws, only_empty=only_empty)
+    print(f"  Orders to check: {len(orders)}")
+
+    # Cache the headers once
+    sheet_headers = ws.row_values(1)
+    writer = StatusBatchWriter(ws, sheet_headers)
+
+    # Fill cancelled orders with "-" immediately
+    if cancelled_rows:
+        print(f"  Writing '-' for {len(cancelled_rows)} cancelled orders...")
+        for row_idx in cancelled_rows:
+            writer.add(row_idx, "-")
+        writer.flush()
+        print(f"  Done marking cancelled orders")
+
+    if not orders:
+        print("  No orders need status checking")
+        return {"total": 0, "checked": 0, "not_found": 0, "errors": 0, "cancelled": len(cancelled_rows)}
+
+    # Navigate to Order Entry to get iframe for API calls (skip if already provided)
+    if iframe_frame is None:
+        iframe_frame = await navigate_to_order_entry(page)
+
+    # Capture CSRF token — try multiple methods
+    csrf_token = ""
+
+    # Method 1: Extract from cookies/meta via JS in the iframe
+    try:
+        csrf_token = await iframe_frame.evaluate("""() => {
+            // Check meta tags
+            const meta = document.querySelector('meta[name="_csrf"]') ||
+                         document.querySelector('meta[name="csrf-token"]');
+            if (meta) return meta.getAttribute('content') || '';
+            // Check if jQuery has it
+            if (typeof $ !== 'undefined' && $.ajaxSettings && $.ajaxSettings.headers)
+                return $.ajaxSettings.headers['X-CSRF-TOKEN'] || '';
+            return '';
+        }""")
+    except Exception:
+        pass
+
+    # Method 2: Do a dummy UI query and intercept the request
+    if not csrf_token:
+        captured_csrf = {}
+
+        async def capture_csrf(request):
+            try:
+                if "callservice.json" in request.url or "qrySubsPageTree" in request.url:
+                    c = request.headers.get("x-csrf-token", "")
+                    if c:
+                        captured_csrf["token"] = c
+            except Exception:
+                pass
+
+        page.on("request", capture_csrf)
+        try:
+            await iframe_frame.locator('input[name="certNbr"]').fill("000000000000", timeout=10000)
+            await page.wait_for_timeout(300)
+            await iframe_frame.locator('input[name="custName"]').fill("TEST", timeout=5000)
+            await page.wait_for_timeout(300)
+            await iframe_frame.locator("button.js-query").click(timeout=5000)
+            await page.wait_for_timeout(3000)
+        except Exception:
+            pass
+        page.remove_listener("request", capture_csrf)
+        csrf_token = captured_csrf.get("token", "")
+
+    # Method 3: Extract from page cookies
+    if not csrf_token:
+        try:
+            cookies = await page.context.cookies()
+            for c in cookies:
+                if "csrf" in c["name"].lower():
+                    csrf_token = c["value"]
+                    break
+        except Exception:
+            pass
+
+    # Method 4: Use the first order's custId to call qrySubsPageTree and intercept CSRF
+    if not csrf_token:
+        captured_csrf2 = {}
+
+        async def capture_csrf2(request):
+            try:
+                csrf = request.headers.get("x-csrf-token", "")
+                if csrf:
+                    captured_csrf2["token"] = csrf
+            except Exception:
+                pass
+
+        page.on("request", capture_csrf2)
+        # Make any API call to the server — just load a page in the iframe
+        try:
+            await iframe_frame.evaluate("""async () => {
+                try {
+                    await fetch('/esales/FishModule/crm/api/subs/qrySubsPageTree', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+                        body: JSON.stringify({ requestParam: { custId: '0', PAGE_REQ: { COUNT_FLAG: 'N', PAGE_MODE: 'S', pageIndex: 1, pageCount: 1 } } }),
+                        credentials: 'include',
+                    });
+                } catch(e) {}
+            }""")
+            await page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        page.remove_listener("request", capture_csrf2)
+        csrf_token = captured_csrf2.get("token", "")
+
+    # Method 5: Search all cookies and session storage
+    if not csrf_token:
+        try:
+            csrf_token = await iframe_frame.evaluate("""() => {
+                // Check sessionStorage
+                for (let i = 0; i < sessionStorage.length; i++) {
+                    const key = sessionStorage.key(i);
+                    if (key.toLowerCase().includes('csrf')) return sessionStorage.getItem(key);
+                }
+                // Check localStorage
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    if (key.toLowerCase().includes('csrf')) return localStorage.getItem(key);
+                }
+                // Check all script-accessible cookies
+                const cookies = document.cookie.split(';');
+                for (const c of cookies) {
+                    if (c.trim().toLowerCase().includes('csrf')) return c.split('=')[1] || '';
+                }
+                // Check window variables
+                if (window._csrf) return window._csrf;
+                if (window.csrfToken) return window.csrfToken;
+                // Check for zsmart framework token
+                try { if (window.zsmart && window.zsmart.csrf) return window.zsmart.csrf; } catch(e) {}
+                try { if (window.Fish && window.Fish.csrf) return window.Fish.csrf; } catch(e) {}
+                return '';
+            }""") or ""
+        except Exception:
+            pass
+
+    if not csrf_token:
+        # Last resort: extract from any XHR setup in the iframe's jQuery/axios
+        try:
+            csrf_token = await iframe_frame.evaluate("""() => {
+                // jQuery
+                try {
+                    if (typeof jQuery !== 'undefined') {
+                        const h = jQuery.ajaxSettings.headers || {};
+                        return h['X-CSRF-TOKEN'] || h['x-csrf-token'] || '';
+                    }
+                } catch(e) {}
+                // Axios
+                try {
+                    if (typeof axios !== 'undefined') {
+                        return axios.defaults.headers.common['X-CSRF-TOKEN'] ||
+                               axios.defaults.headers.common['x-csrf-token'] || '';
+                    }
+                } catch(e) {}
+                return '';
+            }""") or ""
+        except Exception:
+            pass
+
+    if not csrf_token:
+        print("  CSRF token not captured — cannot proceed")
+        print("  Debug: try running backfill_custid first, or check if Order Entry page loaded correctly")
+        return {"total": len(orders), "checked": 0, "not_found": 0, "errors": len(orders)}
+
+    print(f"  CSRF captured — querying via qrySubsPageTree (fast)")
+
+    checked = 0
+    not_found = 0
+    errors = 0
+
+    # Deduplicate: group orders by custId
+    cust_groups: Dict[str, List[Dict]] = {}
+    for order in orders:
+        cid = order["cust_id"]
+        if cid not in cust_groups:
+            cust_groups[cid] = []
+        cust_groups[cid].append(order)
+
+    print(f"  Unique customers: {len(cust_groups)}")
+    print(f"  (Deduplicated from {len(orders)} orders)")
+
+    target = iframe_frame if iframe_frame else page
+    query_num = 0
+    for cust_id, group_orders in cust_groups.items():
+        query_num += 1
+        order_nums = [o["order_number"] for o in group_orders]
+        print(f"\n  [{query_num}/{len(cust_groups)}] custId={cust_id}")
+        print(f"    Orders: {', '.join(order_nums)}")
+
+        try:
+            results = await query_subs_page_tree(target, csrf_token, cust_id)
+            status, status_date = match_status_from_api(results)
+            display_status = status if status else "-"
+            print(f"    {len(results)} entries -> {display_status} ({status_date})")
+
+            for order in group_orders:
+                writer.add(order["row_index"], status, status_date)
+
+            if status == "Not Found":
+                not_found += 1
+            else:
+                checked += 1
+
+        except Exception as e:
+            print(f"    Error: {e}")
+            errors += len(group_orders)
+
+    # Flush remaining writes
+    writer.flush()
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("STATUS CHECK SUMMARY")
+    print("=" * 70)
+    print(f"  Total orders: {len(orders)}")
+    print(f"  Unique customers: {len(cust_groups)}")
+    print(f"  Status found: {checked}")
+    print(f"  Not Found: {not_found}")
+    print(f"  Errors: {errors}")
+    print("=" * 70)
+
+    return {
+        "total": len(orders),
+        "checked": checked,
+        "not_found": not_found,
+        "errors": errors,
+    }
+
+
+async def check_status_standalone(
+    username: str,
+    password: str,
+    month_text: str,
+    year: int,
+) -> Dict:
+    """
+    Standalone entry point: logs in, checks statuses for one month, closes browser.
+    """
+    from login_manager import login_and_get_context
+
+    browser, context, pw, page = await login_and_get_context(username, password)
+
+    try:
+        result = await check_all_statuses(page, month_text, year)
+        return result
+    finally:
+        await context.close()
+        await browser.close()
+        await pw.stop()
+
+
+async def check_status_standalone_empty(
+    username: str,
+    password: str,
+    month_text: str,
+    year: int,
+) -> Dict:
+    """
+    Standalone entry point: only checks orders that don't have a Status yet.
+    """
+    from login_manager import login_and_get_context
+
+    browser, context, pw, page = await login_and_get_context(username, password)
+
+    try:
+        result = await check_all_statuses(page, month_text, year, only_empty=True)
+        return result
+    finally:
+        await context.close()
+        await browser.close()
+        await pw.stop()
+
+
+async def check_status_multi_month(
+    username: str,
+    password: str,
+    months: list,
+) -> Dict:
+    """
+    Check statuses for multiple months in one login session.
+    Args:
+        months: list of (month_text, year) tuples, e.g. [("Jun", 2026), ("May", 2026), ...]
+    """
+    from login_manager import login_and_get_context
+
+    browser, context, pw, page = await login_and_get_context(username, password)
+
+    all_results = {}
+    try:
+        # Navigate to Order Entry once — reused across all months
+        iframe_frame = await navigate_to_order_entry(page)
+
+        for month_text, year in months:
+            print(f"\n{'#' * 70}")
+            print(f"# CHECKING: {month_text} {year}")
+            print(f"{'#' * 70}")
+            try:
+                result = await check_all_statuses(page, month_text, year, iframe_frame=iframe_frame)
+                all_results[f"{month_text} {year}"] = result
+            except Exception as e:
+                print(f"  Error checking {month_text} {year}: {e}")
+                all_results[f"{month_text} {year}"] = {"error": str(e)}
+    finally:
+        await context.close()
+        await browser.close()
+        await pw.stop()
+
+    # Print overall summary
+    print(f"\n{'=' * 70}")
+    print("MULTI-MONTH STATUS CHECK COMPLETE")
+    print(f"{'=' * 70}")
+    for key, result in all_results.items():
+        if "error" in result:
+            print(f"  {key}: ERROR - {result['error']}")
+        else:
+            print(f"  {key}: {result.get('checked', 0)} checked, {result.get('not_found', 0)} not found, {result.get('errors', 0)} errors")
+    print(f"{'=' * 70}")
+
+    return all_results
+
+
+def get_last_n_months(n: int) -> list:
+    """
+    Return list of (month_text, year) tuples for the last N months including current.
+    E.g. if now is Jun 2026 and n=6: [("Jun", 2026), ("May", 2026), ..., ("Jan", 2026)]
+    """
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    now = datetime.now(LOCAL_TZ) if LOCAL_TZ else datetime.now()
+    months = []
+    for i in range(n):
+        month_idx = now.month - 1 - i  # 0-based
+        year = now.year
+        while month_idx < 0:
+            month_idx += 12
+            year -= 1
+        months.append((month_names[month_idx], year))
+    return months
+
+
+def check_status_sync(month_text: str, year: int) -> Dict:
+    """
+    Synchronous wrapper — loads credentials and runs the status check.
+    """
+    import asyncio
+
+    from credential_manager import CredentialManager
+
+    cred_manager = CredentialManager()
+    if not cred_manager.credentials_exist():
+        return {"success": False, "error": "No credentials saved"}
+
+    creds = cred_manager.get_credentials()
+    username = creds.get("username")
+    password = creds.get("password")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            check_status_standalone(username, password, month_text, year)
+        )
+        return result
+    finally:
+        loop.close()

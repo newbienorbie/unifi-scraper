@@ -177,7 +177,7 @@ async def click_and_select_all_agents(page) -> int:
     """Click Filter, expand Created by, select all agents with pagination support"""
     print("\n🎯 Selecting agents from UI...")
 
-    await page.click('button.operateBtn___13GXb:has-text("Filter")', timeout=8000)
+    await page.click('button:has-text("Filter")', timeout=15000)
     await page.wait_for_timeout(5000)
 
     # Expand "Created by" section
@@ -351,6 +351,7 @@ async def scrape_orders_month(
     output_format: str = "sheets",
     csv_filename: Optional[str] = None,
     full_sync: bool = True,  # NEW: Set to True to capture everything, False for smart sync
+    check_status: bool = False,  # Run subscriber status check after scraping
 ) -> Dict:
     """
     Scrape orders by clicking Details and capturing API response
@@ -392,7 +393,7 @@ async def scrape_orders_month(
         else:
             all_orders = []
             if not csv_filename:
-                csv_filename = f"unifi_orders_{month_text}_{year}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                csv_filename = f"unifi_orders_{month_text}_{year}_{datetime.now(LOCAL_TZ).strftime('%Y%m%d_%H%M%S')}.csv"
             csv_path = os.path.join(OUTPUT_DIR, csv_filename)
             checkpoint_file = csv_path.replace(".csv", "_checkpoint.json")
             print(f"📄 CSV file: {csv_path}")
@@ -400,11 +401,25 @@ async def scrape_orders_month(
 
         # Navigate to History
         print("\n📑 Navigating to History tab...")
-        try:
-            await page.click('div.item___1xee2:has-text("History")', timeout=10000)
-            await page.wait_for_timeout(10000)
-        except:
-            pass
+        print(f"  📍 Current URL: {page.url}")
+        await page.screenshot(path="logs/before_history_click.png")
+
+        # Retry clicking History tab — the page may still be loading
+        history_clicked = False
+        for attempt in range(3):
+            try:
+                await page.locator('text="History"').last.click(timeout=15000)
+                history_clicked = True
+                print(f"  ✅ History tab clicked (attempt {attempt + 1})")
+                await page.wait_for_timeout(10000)
+                break
+            except Exception as e:
+                print(f"  ⚠️ Attempt {attempt + 1} failed: {e}")
+                await page.wait_for_timeout(5000)
+
+        if not history_clicked:
+            print("  ❌ All History tab attempts failed")
+            await page.screenshot(path="logs/history_tab_failed.png")
 
         # Set month filter with YEAR support
         try:
@@ -413,13 +428,11 @@ async def scrape_orders_month(
             await close_blocking_popup(page)
 
             # Click to open date picker
-            await page.click(
-                ".ant-picker.select___38REx .ant-picker-input", timeout=5000
-            )
+            await page.click(".ant-picker .ant-picker-input", timeout=15000)
             await page.wait_for_timeout(5000)
 
             # Navigate to correct year
-            current_year = datetime.now().year
+            current_year = datetime.now(LOCAL_TZ).year
             year_diff = year - current_year
 
             if year_diff < 0:
@@ -443,7 +456,7 @@ async def scrape_orders_month(
 
             # Now select the month
             await page.click(
-                f'td.ant-picker-cell:has-text("{month_text}")', timeout=5000
+                f'td.ant-picker-cell:has-text("{month_text}")', timeout=20000
             )
             await page.wait_for_timeout(1000)
             print(f"  ✅ Set to {month_text} {year}")
@@ -499,7 +512,7 @@ async def scrape_orders_month(
 
                     # Wait for page to reload
                     print("⏳ Waiting for page to reload...")
-                    await page.wait_for_timeout(30000)
+                    await page.wait_for_timeout(45000)
 
                     # Count rows after change
                     new_row_count = await page.locator("tbody tr.ant-table-row").count()
@@ -620,24 +633,43 @@ async def scrape_orders_month(
             p = await ctx.new_page()
             p.on("response", _intercept)
 
-            try:
-                url = f"https://dealer.unifi.com.my/esales/h5/onBoarding/OrderDetails?custOrderId={order_id}&custOrderNbr={order_id}"
-                await p.goto(url, wait_until="networkidle", timeout=45000)
-
-                # NEW: actively wait for the JSON to arrive (up to ~10s)
-                for _ in range(20):  # 20 * 500ms = 10s
-                    if "json" in captured:
-                        break
-                    await p.wait_for_timeout(600)
-
-                # small extra buffer
-                await p.wait_for_timeout(500)
-
-            finally:
+            max_attempts = 2
+            for attempt in range(1, max_attempts + 1):
                 try:
-                    await p.close()
-                except Exception:
-                    pass
+                    url = f"https://dealer.unifi.com.my/esales/h5/onBoarding/OrderDetails?custOrderId={order_id}&custOrderNbr={order_id}"
+                    await p.goto(url, wait_until="networkidle", timeout=90000)
+
+                    # Actively wait for the JSON to arrive (up to ~10s)
+                    for _ in range(20):  # 20 * 500ms = 10s
+                        if "json" in captured:
+                            break
+                        await p.wait_for_timeout(600)
+
+                    # small extra buffer
+                    await p.wait_for_timeout(500)
+
+                    if "json" in captured:
+                        break  # success
+
+                    if attempt < max_attempts:
+                        print(
+                            f"  ⚠️ Attempt {attempt} failed for {order_id}, retrying in 5s..."
+                        )
+                        await p.wait_for_timeout(5000)
+
+                except Exception as e:
+                    if attempt < max_attempts:
+                        print(
+                            f"  ⚠️ Attempt {attempt} error for {order_id}: {e}, retrying in 5s..."
+                        )
+                        await p.wait_for_timeout(5000)
+                    else:
+                        print(f"  ❌ All attempts failed for {order_id}: {e}")
+
+            try:
+                await p.close()
+            except Exception:
+                pass
 
             if "json" not in captured:
                 print(f"⚠️ No getCeeOrderDetail JSON captured for {order_id}")
@@ -921,27 +953,41 @@ async def scrape_orders_month(
                                         package = offer_name
                                         break
 
-                            # --- NEW: Company Name Logic ---
+                            # --- Company Name Logic ---
                             company_name = ""
-                            # If package contains "biz" (case insensitive), capture the Company Name
-                            if "biz" in package.lower():
+                            # Capture company name if package contains "biz" OR cert type is business
+                            cert_type_name = cust_info.get("certTypeName", "").lower()
+                            is_business = (
+                                "biz" in package.lower()
+                                or "business" in cert_type_name
+                                or "company" in cert_type_name
+                                or cust_info.get("custType") == "B"
+                            )
+                            if is_business:
                                 company_name = cust_info.get("custName", "")
 
-                            # --- 🚀 NEW: Device Name Logic ---
+                            # --- Device Name Logic ---
                             device_name = ""
-                            if "with device" in package.lower():
+                            if "device" in package.lower():
                                 for item in order_items:
                                     for offer in item.get("offerInstList", []):
-                                        # Look for the SMART_DEVICE tag in the attributes
-                                        for attr in offer.get("attrValueList", []):
-                                            if (
-                                                attr.get("attrCode")
-                                                == "TM_ADDITIONAL_OFFER_CATG"
-                                                and attr.get("value") == "SMART_DEVICE"
-                                            ):
-                                                device_name = offer.get("offerName", "")
-                                                break
-                                        if device_name:
+                                        attrs = {a.get("attrCode"): a.get("value") for a in offer.get("attrValueList", [])}
+                                        catg = attrs.get("TM_ADDITIONAL_OFFER_CATG", "")
+                                        offer_name_lower = (offer.get("offerName") or "").lower()
+                                        is_device = (
+                                            catg == "SMART_DEVICE"
+                                            or "EXP_DEVICE_ESN" in attrs
+                                            or (
+                                                "EXP_GOODS_DELIVERY_METHOD" in attrs
+                                                and catg not in ("COMBOX", "")
+                                            )
+                                            or (
+                                                "EXP_GOODS_DELIVERY_METHOD" in attrs
+                                                and any(kw in offer_name_lower for kw in ["ipad", "tablet", "phone", "watch", "galaxy", "iphone", "samsung", "device", "premium value"])
+                                            )
+                                        )
+                                        if is_device and offer.get("offerName"):
+                                            device_name = offer.get("offerName", "")
                                             break
                                     if device_name:
                                         break
@@ -1057,7 +1103,9 @@ async def scrape_orders_month(
                                 "Device": device_name,
                                 "IC Number": ic_number,
                                 "Creator": creator,
-                                "Last Synced": datetime.now().isoformat(),
+                                "Last Synced": "'"
+                                + datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                                "Cust ID": str(cust_info.get("custId", "")),
                             }
 
                             if output_format == "sheets":
@@ -1067,7 +1115,7 @@ async def scrape_orders_month(
                                 upsert_rows(ws, [row_data])
 
                                 # Update our tracking
-                                complete_orders[order_id] = datetime.now()
+                                complete_orders[order_id] = datetime.now(LOCAL_TZ)
                                 if order_id in incomplete_orders:
                                     del incomplete_orders[order_id]
 
@@ -1091,7 +1139,7 @@ async def scrape_orders_month(
                                     writer.writerow(row_data)
 
                                 # Update checkpoint with datetime
-                                complete_orders[order_id] = datetime.now()
+                                complete_orders[order_id] = datetime.now(LOCAL_TZ)
                                 if order_id in incomplete_orders:
                                     del incomplete_orders[order_id]
 
@@ -1101,7 +1149,7 @@ async def scrape_orders_month(
                                         for k, v in complete_orders.items()
                                     },
                                     "incomplete": incomplete_orders,
-                                    "last_update": datetime.now().isoformat(),
+                                    "last_update": datetime.now(LOCAL_TZ).isoformat(),
                                 }
                                 with open(checkpoint_file, "w") as f:
                                     json.dump(checkpoint_data, f)
@@ -1292,7 +1340,8 @@ async def scrape_orders_month(
                             last_synced_dt = parse_last_synced(last_synced)
                             if (
                                 last_synced_dt
-                                and last_synced_dt.date() == datetime.now().date()
+                                and last_synced_dt.date()
+                                == datetime.now(LOCAL_TZ).date()
                             ):
                                 new_orders_count += 1
                         except Exception:
@@ -1305,7 +1354,8 @@ async def scrape_orders_month(
                             last_synced_dt = parse_last_synced(last_synced)
                             if (
                                 last_synced_dt
-                                and last_synced_dt.date() == datetime.now().date()
+                                and last_synced_dt.date()
+                                == datetime.now(LOCAL_TZ).date()
                             ):
                                 is_newly_scraped = True
                                 new_orders_count += 1
@@ -1322,8 +1372,8 @@ async def scrape_orders_month(
 
                 # Create summary JSON
                 summary = {
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "date": datetime.now(LOCAL_TZ).strftime("%Y-%m-%d"),
+                    "time": datetime.now(LOCAL_TZ).strftime("%H:%M:%S"),
                     "month": month_text,
                     "year": year,
                     "tab_name": tab_title,
@@ -1347,7 +1397,7 @@ async def scrape_orders_month(
                 summary_dir = os.path.join(OUTPUT_DIR, "summaries")
                 os.makedirs(summary_dir, exist_ok=True)
 
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                timestamp = datetime.now(LOCAL_TZ).strftime("%Y%m%d_%H%M%S")
                 summary_file = os.path.join(summary_dir, f"summary_{timestamp}.json")
 
                 with open(summary_file, "w", encoding="utf-8") as f:
@@ -1373,6 +1423,19 @@ async def scrape_orders_month(
                 sort_tab_by_created_date(ws, descending=True)
             except Exception as e:
                 print(f"⚠️ Warning: Could not sort tab: {e}")
+
+        # Run subscriber status check if enabled (sheets mode only)
+        if check_status and output_format == "sheets":
+            try:
+                from check_status import check_all_statuses
+
+                print(f"\n🔍 Running subscriber status check...")
+                status_result = await check_all_statuses(page, month_text, year, ws)
+                print(f"  Status check complete: {status_result.get('checked', 0)} checked, "
+                      f"{status_result.get('not_found', 0)} not found, "
+                      f"{status_result.get('errors', 0)} errors")
+            except Exception as e:
+                print(f"⚠️ Warning: Status check failed: {e}")
 
         # Cleanup CSV checkpoint
         if output_format == "csv":
@@ -1437,9 +1500,10 @@ async def scrape_to_sheets(
     month_text: str,
     year: int,
     full_sync: bool = False,
+    check_status: bool = False,
 ):
     return await scrape_orders_month(
-        username, password, month_text, year, "sheets", None, full_sync
+        username, password, month_text, year, "sheets", None, full_sync, check_status
     )
 
 
@@ -1464,7 +1528,7 @@ async def scrape_to_csv(
 
 # New convenience functions for specific modes
 async def scrape_full_sync_to_sheets(
-    username: str, password: str, month_text: str, year: int
+    username: str, password: str, month_text: str, year: int, check_status: bool = False
 ):
     """Scrape ALL orders to sheets (ignores existing data)"""
     return await scrape_orders_month(
@@ -1475,11 +1539,12 @@ async def scrape_full_sync_to_sheets(
         "sheets",
         None,
         full_sync=True,
+        check_status=check_status,
     )
 
 
 async def scrape_incremental_to_sheets(
-    username: str, password: str, month_text: str, year: int
+    username: str, password: str, month_text: str, year: int, check_status: bool = False
 ):
     """Smart incremental sync to sheets (only new/updated orders)"""
     return await scrape_orders_month(
@@ -1490,10 +1555,11 @@ async def scrape_incremental_to_sheets(
         "sheets",
         None,
         full_sync=False,
+        check_status=check_status,
     )
 
 
-def scrape_month(month_text: str, year: int, full_sync: bool = True):
+def scrape_month(month_text: str, year: int, full_sync: bool = True, check_status: bool = False):
     """
     Synchronous wrapper for API - loads credentials and runs scrape
     """
@@ -1523,6 +1589,7 @@ def scrape_month(month_text: str, year: int, full_sync: bool = True):
                 output_format="sheets",
                 csv_filename=None,
                 full_sync=full_sync,
+                check_status=check_status,
             )
         )
         return result

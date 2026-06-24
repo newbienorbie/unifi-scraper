@@ -84,29 +84,50 @@ def _patch_script(body: str, url: str) -> str:
     original = body
     fname = url.split("/")[-1]
 
-    # PRIMARY: kill Hy()({...ondevtoolopen:function(){...}}) — confirmed pattern
+    # 1. Kill the disable-devtool initialization block:
+    #    { disableMenu: !0, ..., clearLog: !0, ondevtoolopen: function() { window.location.href = "/esales/login" } }
+    body = re.sub(
+        r'ondevtoolopen:\s*function\s*\(\)\s*\{\s*window\.location\.href\s*=\s*["\'][^"\']*["\']\s*\}',
+        "ondevtoolopen: function() { /* patched */ }",
+        body,
+    )
+
+    # 2. Kill the default ondevtoolopen handler (d function that does history.back + redirect)
+    body = re.sub(
+        r"(ondevtoolopen:\s*)d,",
+        r"\1function(){},",
+        body,
+    )
+
+    # 3. Neuter clearLog
+    body = re.sub(
+        r"clearLog:\s*!0",
+        "clearLog: !1",
+        body,
+    )
+
+    # 4. Kill window.location.reload calls
+    body = body.replace("window.location.reload(!0)", "void 0/* reload blocked */")
+    body = body.replace("window.location.reload()", "void 0/* reload blocked */")
+    body = body.replace("location.reload()", "void 0/* reload blocked */")
+
+    # 5. Block no-devtool redirects
+    body = body.replace("/esales/no-devtool.html", "/esales/login")
+    body = body.replace('"no-devtool.html"', '"login"')
+    body = body.replace("'no-devtool.html'", "'login'")
+
+    # 6. Kill the disable-devtool auto-init attribute check
+    body = body.replace("[disable-devtool-auto]", "[disable-devtool-disabled]")
+
+    # 7. Legacy patterns (in case old format still exists)
     body = re.sub(
         r"Hy\(\)\(\{[^}]*ondevtoolopen:function\(\)\{[^}]*\}\}\)",
         "void 0/* DisableDevtool removed */",
         body,
     )
 
-    # SECONDARY: kill Vy wrapper function body
-    body = re.sub(
-        r"(,Vy=function\(\)\{)try\{[^}]+if\([^)]+\)return;Hy[^}]+\}[^}]+\}catch[^}]+\}",
-        r"\1/* devtool detector removed */}",
-        body,
-    )
-
-    # FALLBACK
-    body = body.replace("window.location.reload()", "void 0/* reload blocked */")
-    body = body.replace("location.reload()", "void 0/* reload blocked */")
-    body = body.replace("/esales/no-devtool.html", "/esales/login")
-    body = body.replace('"no-devtool.html"', '"login"')
-    body = body.replace("'no-devtool.html'", "'login'")
-
     if body != original:
-        print(f"    ↳ Surgically patched: {fname}")
+        print(f"    ↳ Patched: {fname}")
     else:
         print(f"    ↳ ⚠️  No pattern matched in: {fname}")
 
@@ -124,6 +145,9 @@ async def _launch_browser_safe():
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--start-maximized",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--single-process",
             ],
             ignore_default_args=["--enable-automation"],
         )
@@ -137,55 +161,58 @@ async def _launch_browser_safe():
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/122.0.0.0 Safari/537.36"
         ),
+        extra_http_headers={
+            "sec-ch-ua": '"Not=A?Brand";v="24", "Chromium";v="122"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+        },
     )
 
     await context.add_init_script(STEALTH_SCRIPT)
     stealth = Stealth()
     await stealth.apply_stealth_async(context)
 
-    async def block_anti_bot(route):
-        url = route.request.url
-        url_lower = url.lower()
+    fishx_cache = {}
 
-        if any(k in url_lower for k in ["no-devtool", "disable-devtool"]):
-            print(f"🛡️ Blocked URL: {url}")
-            await route.abort()
+    async def handle_fishx_route(route):
+        """Intercept fishx scripts. Patch once, serve from cache after."""
+        url = route.request.url
+        cache_key = url.split("?")[0]
+
+        if cache_key in fishx_cache:
+            await route.fulfill(
+                status=200,
+                headers={"Content-Type": "application/javascript"},
+                body=fishx_cache[cache_key],
+            )
             return
 
-        if route.request.resource_type == "script":
-            try:
-                response = await route.fetch()
-                body = await response.text()
-                lower = body.lower()
+        try:
+            response = await route.fetch()
+            body = await response.text()
+            patched = _patch_script(body, url)
+            fishx_cache[cache_key] = patched
+            await route.fulfill(
+                status=response.status,
+                headers=dict(response.headers),
+                body=patched,
+            )
+        except Exception as e:
+            print(f"⚠️ fishx intercept failed for {url}: {e}")
+            await route.continue_()
 
-                if any(
-                    k in lower
-                    for k in [
-                        "no-devtool",
-                        "disabledevtool",
-                        "disable-devtool",
-                        "devtoolsdetector",
-                        "ondevtoolopen",
-                    ]
-                ):
-                    print(f"🛡️ Patching script: {url}")
-                    patched = _patch_script(body, url)
-                    await route.fulfill(
-                        status=response.status,
-                        headers=dict(response.headers),
-                        body=patched,
-                    )
-                    return
-            except Exception as e:
-                print(f"⚠️ Script intercept failed for {url}: {e}")
+    async def block_anti_bot_urls(route):
+        """Block known anti-bot redirect URLs."""
+        print(f"🛡️ Blocked URL: {route.request.url}")
+        await route.abort()
 
-        await route.continue_()
-
-    await context.route("**/*", block_anti_bot)
+    await context.route("**/fishx*.js", handle_fishx_route)
+    await context.route("**/*no-devtool*", block_anti_bot_urls)
+    await context.route("**/*disable-devtool*", block_anti_bot_urls)
 
     page = await context.new_page()
     page.set_default_timeout(45000)
-    page.set_default_navigation_timeout(60000)
+    page.set_default_navigation_timeout(90000)
 
     async def on_frame_navigated(frame):
         try:
@@ -285,13 +312,22 @@ async def login_and_get_context(username: str, password: str):
     await page.wait_for_selector(
         "#login-form_staffCode", state="visible", timeout=30000
     )
+    # Wait for the full form to render (OTP field, channel dropdown)
+    try:
+        await page.wait_for_selector(
+            "#login-form_smsCode", state="visible", timeout=15000
+        )
+        print("  ✅ OTP field loaded")
+    except Exception:
+        print("  ⚠️ OTP field not found, waiting longer...")
+        await page.wait_for_timeout(5000)
     await page.wait_for_timeout(1500)
 
     await page.fill("#login-form_staffCode", username)
     await page.fill("#login-form_password", password)
 
     # --- Select OTP Channel (SMS) ---
-    print("Selecting OTP Channel (SMS)...")
+    print("Selecting OTP Channel (Email)...")
     try:
         channel_dropdown = page.locator("#login-form_channel")
         if await channel_dropdown.count() == 0:
@@ -310,12 +346,32 @@ async def login_and_get_context(username: str, password: str):
     print("Accepting Terms and Conditions...")
     try:
         await page.locator("input#login-form_rememerMe").check(force=True, timeout=3000)
-        await page.locator('.policy___1uV3w input[type="checkbox"]').check(
-            force=True, timeout=3000
-        )
+        print("  ✅ Remember Me checked")
+    except Exception as e:
+        print(f"  ⚠️ Remember Me checkbox: {e}")
+    try:
+        # Try multiple selectors for T&C checkbox (CSS hash may change)
+        tc_checked = False
+        tc_selectors = [
+            '.policy___1uV3w input[type="checkbox"]',
+            'div[class*="policy"] input[type="checkbox"]',
+            'input[type="checkbox"]:not(#login-form_rememerMe)',
+        ]
+        for sel in tc_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    await loc.check(force=True, timeout=3000)
+                    tc_checked = True
+                    print(f"  ✅ T&C checked via: {sel}")
+                    break
+            except Exception:
+                continue
+        if not tc_checked:
+            print("  ⚠️ Could not find T&C checkbox")
         await page.wait_for_timeout(1000)
     except Exception as e:
-        print(f"⚠️ Warning clicking checkboxes: {e}")
+        print(f"  ⚠️ Warning clicking checkboxes: {e}")
 
     # --- Request OTP ---
     print("Requesting OTP...")
@@ -351,6 +407,9 @@ async def login_and_get_context(username: str, password: str):
                 f"Could not fill OTP field. Check logs/otp_fill_failed.png. Error: {e}"
             )
 
+        await page.screenshot(path="logs/before_sign_in.png")
+        print("📸 Screenshot saved to logs/before_sign_in.png")
+
         print("Clicking Sign In...")
         try:
             await page.click('button:has-text("Sign In")', force=True, timeout=5000)
@@ -360,9 +419,23 @@ async def login_and_get_context(username: str, password: str):
         print("Sign In clicked, waiting for dashboard...")
         await page.wait_for_timeout(10000)
 
+        # Check if login succeeded
+        await page.screenshot(path="logs/after_sign_in.png")
+        print(f"  📍 URL after sign in: {page.url}")
+        if "login" in page.url.lower():
+            print("  ⚠️ Still on login page after Sign In, waiting longer...")
+            await page.wait_for_timeout(15000)
+            await page.screenshot(path="logs/after_sign_in_extra_wait.png")
+            print(f"  📍 URL after extra wait: {page.url}")
+
         print("Navigating to Retail History...")
-        await page.goto(HISTORY_URL, wait_until="networkidle")
+        await page.goto(HISTORY_URL, wait_until="networkidle", timeout=90000)
         await page.wait_for_timeout(3000)
+
+        print(f"  📍 URL after navigation: {page.url}")
+        if "login" in page.url.lower():
+            await page.screenshot(path="logs/login_redirect.png")
+            print("  ❌ Redirected back to login — authentication failed")
 
         try:
             later_btn = page.locator('button.ant-btn:has-text("Later")')

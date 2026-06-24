@@ -1,0 +1,106 @@
+"""
+Daily job: scrape orders for last 6 months, then refresh statuses.
+
+1. Login once to establish/refresh session cache
+2. Run all 6 months in PARALLEL (each reuses cached session)
+3. Check statuses for all 6 months (single login session)
+"""
+import asyncio
+import subprocess
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from check_status import check_status_multi_month, get_last_n_months
+from credential_manager import CredentialManager
+from login_manager import login_and_get_context
+
+LOCAL_TZ = ZoneInfo("Asia/Kuala_Lumpur")
+
+
+HISTORY_URL = "https://dealer.unifi.com.my/esales/retailHistory"
+
+
+async def establish_session(username: str, password: str):
+    """Login once, verify session works by navigating to History, then close."""
+    print("Logging in to establish session cache...")
+    browser, context, pw, page = await login_and_get_context(username, password)
+
+    # Verify session is actually working before we let parallel scrapers use it
+    print("Verifying session by navigating to History page...")
+    await page.goto(HISTORY_URL, wait_until="networkidle", timeout=60000)
+    await page.wait_for_timeout(5000)
+
+    if "login" in page.url.lower():
+        raise RuntimeError("Session not valid after login — stuck on login page")
+
+    # Click History tab and confirm it loads
+    try:
+        await page.locator('text="History"').last.click(timeout=10000)
+        await page.wait_for_timeout(3000)
+        if await page.locator(".ant-picker").count() > 0:
+            print("Session verified — History page loaded successfully")
+        else:
+            print("Warning: History page loaded but date picker not found")
+    except Exception as e:
+        print(f"Warning: Could not verify History tab: {e}")
+
+    # Re-save session after verification to ensure cookies are fresh
+    from login_manager import save_session
+    await save_session(context)
+    print("Session re-saved after verification.\n")
+
+    await context.close()
+    await browser.close()
+    await pw.stop()
+
+
+def run_scrape_subprocess(month: str, year: int) -> subprocess.CompletedProcess:
+    """Run a single month scrape as a subprocess so each gets its own browser."""
+    return subprocess.run(
+        [sys.executable, "-c", f"""
+import asyncio
+from dotenv import load_dotenv
+load_dotenv()
+from credential_manager import CredentialManager
+from scrape_orders import scrape_incremental_to_sheets
+creds = CredentialManager().get_credentials()
+asyncio.run(scrape_incremental_to_sheets(creds["username"], creds["password"], "{month}", {year}))
+"""],
+        capture_output=False,
+    )
+
+
+async def main():
+    creds = CredentialManager().get_credentials()
+    username, password = creds["username"], creds["password"]
+    months = get_last_n_months(6)
+
+    print(f"=== DAILY RUN: {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')} ===")
+    print(f"Months: {months}\n")
+
+    # Step 1: Login to cache session
+    await establish_session(username, password)
+
+    # Step 2: Scrape all 6 months sequentially (1GB server can't handle parallel browsers)
+    print(f"=== STEP 2: Scraping {len(months)} months sequentially ===")
+    results = []
+    for m, y in months:
+        print(f"  Starting {m} {y}...")
+        result = run_scrape_subprocess(m, y)
+        results.append(((m, y), result))
+        status = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
+        print(f"  {m} {y}: {status}")
+
+    # Step 3: Refresh statuses for all 6 months
+    print(f"\n=== STEP 3: Checking statuses for all {len(months)} months ===")
+    await check_status_multi_month(username, password, months)
+
+    print(f"\n=== DAILY RUN COMPLETE: {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')} ===")
+
+
+asyncio.run(main())

@@ -25,6 +25,10 @@ HEADERS = [
     "IC Number",
     "Creator",
     "Last Synced",
+    "Cust ID",
+    "Status",
+    "Status Latest Date",
+    "Status Scrape Date",
 ]
 
 MONTH_ORDER = [
