@@ -97,6 +97,10 @@ def get_orders_to_check(ws, only_empty: bool = False) -> Tuple[List[Dict], List[
         idx_order_status = col_idx("Order Status")
         idx_cust_id = col_idx("Cust ID")
         idx_status = col_idx("Status")
+        idx_address = col_idx("Address")
+        idx_package = col_idx("Package")
+        idx_ic = col_idx("IC Number")
+        idx_name = col_idx("Name")
 
         if idx_order == -1:
             print("  Missing Order Number column")
@@ -112,7 +116,9 @@ def get_orders_to_check(ws, only_empty: bool = False) -> Tuple[List[Dict], List[
                 continue
 
             # Pad row
-            max_idx = max(idx_order, idx_order_status or 0, idx_cust_id or 0, idx_status or 0)
+            max_idx = max(idx_order, idx_order_status or 0, idx_cust_id or 0, idx_status or 0,
+                          idx_address if idx_address != -1 else 0, idx_package if idx_package != -1 else 0,
+                          idx_ic if idx_ic != -1 else 0, idx_name if idx_name != -1 else 0)
             while len(row) <= max_idx:
                 row.append("")
 
@@ -135,10 +141,19 @@ def get_orders_to_check(ws, only_empty: bool = False) -> Tuple[List[Dict], List[
                 skipped_no_cust_id.append(order_number)
                 continue
 
+            address = row[idx_address].strip() if idx_address != -1 else ""
+            package = row[idx_package].strip() if idx_package != -1 else ""
+            ic_number = row[idx_ic].strip() if idx_ic != -1 else ""
+            name = row[idx_name].strip() if idx_name != -1 else ""
+
             orders.append({
                 "row_index": row_num,
                 "order_number": order_number,
                 "cust_id": cust_id,
+                "address": address,
+                "package": package,
+                "ic_number": ic_number,
+                "name": name,
             })
 
         if skipped_no_cust_id:
@@ -366,7 +381,21 @@ async def query_subs_page_tree(target, csrf_token: str, cust_id: str) -> List[Di
         if not data.get("isSuccess"):
             return []
 
-        return data.get("subsList", []) or []
+        subs_list = data.get("subsList", []) or []
+
+        # Log available fields on first result for debugging
+        if subs_list and not hasattr(query_subs_page_tree, "_logged_fields"):
+            query_subs_page_tree._logged_fields = True
+            sample = subs_list[0]
+            print(f"    [DEBUG] subsList entry keys: {list(sample.keys())}")
+            # Log address-related fields
+            addr_keys = [k for k in sample.keys() if "addr" in k.lower() or "address" in k.lower() or "install" in k.lower()]
+            if addr_keys:
+                print(f"    [DEBUG] Address-related fields: {addr_keys}")
+                for k in addr_keys:
+                    print(f"    [DEBUG]   {k} = {sample.get(k, '')!r}")
+
+        return subs_list
 
     except Exception:
         return []
@@ -419,6 +448,20 @@ async def query_via_order_detail(target, context, csrf_token: str, order_id: str
     return subs
 
 
+_INACTIVE_STATES = {"Transfer Out", "Terminated", "Suspended", ""}
+
+
+def _all_inactive(results: List[Dict]) -> bool:
+    """Check if all subscriber results have inactive statuses."""
+    if not results:
+        return True
+    return all(
+        (r.get("prodStateName", "") or PROD_STATE_MAP.get(r.get("prodState", ""), ""))
+        in _INACTIVE_STATES
+        for r in results
+    )
+
+
 def _get_status(entry: Dict) -> str:
     """Extract status from a result entry. Returns empty string if no status."""
     return entry.get("prodStateName", "") or PROD_STATE_MAP.get(
@@ -426,34 +469,113 @@ def _get_status(entry: Dict) -> str:
     )
 
 
-def match_status_from_api(results: List[Dict], package: str = "") -> Tuple[str, str]:
+def _normalize_address(addr: str) -> str:
+    """Normalize address for comparison: lowercase, strip punctuation/whitespace."""
+    if not addr:
+        return ""
+    import re as _re
+    # Lowercase, collapse whitespace, remove commas/dots/dashes
+    addr = addr.lower().strip()
+    addr = _re.sub(r"[,.\-/]", " ", addr)
+    addr = _re.sub(r"\s+", " ", addr)
+    return addr
+
+
+def _address_match_score(addr1: str, addr2: str) -> float:
     """
-    Find the subscriber status from API results.
-    If any entry has a status, use it — all entries for the same customer
-    typically share the same status.
+    Score how well two addresses match (0.0 = no match, 1.0 = exact).
+    Uses word overlap ratio.
+    """
+    if not addr1 or not addr2:
+        return 0.0
+    words1 = set(_normalize_address(addr1).split())
+    words2 = set(_normalize_address(addr2).split())
+    if not words1 or not words2:
+        return 0.0
+    overlap = words1 & words2
+    # Use Jaccard-like score but biased toward the shorter set
+    return len(overlap) / min(len(words1), len(words2))
+
+
+def _extract_status_date(entry: Dict) -> str:
+    """Extract and format the status date from an entry."""
+    date = entry.get("prodStateDate") or entry.get("completedDate") or ""
+    if date:
+        try:
+            from datetime import datetime as _dt
+            for fmt in ["%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"]:
+                try:
+                    dt = _dt.strptime(date, fmt)
+                    date = dt.strftime("%d %b %Y")
+                    break
+                except ValueError:
+                    continue
+        except Exception:
+            pass
+    return date
+
+
+# Common address field names in the subsList API response
+_ADDR_FIELDS = [
+    "installAddress", "installAddr", "address", "displayAddress",
+    "fullAddress", "subsAddr", "serviceAddress",
+]
+
+
+def _get_entry_address(entry: Dict) -> str:
+    """Try to extract an address from a subsList entry."""
+    for field in _ADDR_FIELDS:
+        val = entry.get(field, "")
+        if val and isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def match_status_from_api(results: List[Dict], order_address: str = "") -> Tuple[str, str]:
+    """
+    Find the subscriber status from API results by matching address.
+    If multiple subscribers exist, find the one whose address matches the order address.
+    Falls back to first entry with status if no address match found.
     Returns (status, status_date) tuple.
     """
     if not results:
         return "Not Found", ""
 
-    # Just find the first entry with a non-empty status
+    # If we have an order address, try to match by address first
+    if order_address:
+        best_match = None
+        best_score = 0.0
+
+        for r in results:
+            entry_addr = _get_entry_address(r)
+            if not entry_addr:
+                continue
+            score = _address_match_score(order_address, entry_addr)
+            status = _get_status(r)
+            if score > best_score and status:
+                best_score = score
+                best_match = r
+
+        # Accept match if score is reasonable (>0.5 = more than half the words match)
+        if best_match and best_score > 0.5:
+            status = _get_status(best_match)
+            date = _extract_status_date(best_match)
+            entry_addr = _get_entry_address(best_match)
+            print(f"    Address matched (score={best_score:.2f}): {entry_addr[:60]}")
+            return status, date
+        elif order_address and len(results) > 1:
+            # Log that we couldn't match by address
+            entry_addrs = [_get_entry_address(r) for r in results if _get_entry_address(r)]
+            if entry_addrs:
+                print(f"    No address match found (order: {order_address[:50]}...)")
+                for ea in entry_addrs[:3]:
+                    print(f"      vs: {ea[:60]}")
+
+    # Fallback: first entry with a non-empty status
     for r in results:
         status = _get_status(r)
         if status:
-            # prodStateDate = when the status last changed
-            date = r.get("prodStateDate") or r.get("completedDate") or ""
-            if date:
-                try:
-                    from datetime import datetime as _dt
-                    for fmt in ["%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"]:
-                        try:
-                            dt = _dt.strptime(date, fmt)
-                            date = dt.strftime("%d %b %Y")
-                            break
-                        except ValueError:
-                            continue
-                except Exception:
-                    pass
+            date = _extract_status_date(r)
             return status, date
 
     # All entries have empty status
@@ -483,14 +605,19 @@ class StatusBatchWriter:
         except ValueError:
             self.time_col = -1
 
-    def add(self, row_index: int, status: str, status_date: str = ""):
+        try:
+            self.cust_id_col = headers.index("Cust ID") + 1
+        except ValueError:
+            self.cust_id_col = -1
+
+    def add(self, row_index: int, status: str, status_date: str = "", new_cust_id: str = ""):
         if self.status_col == -1:
             print("    Status column not found in headers")
             return
         if not status:
             status = "-"
         timestamp = "'" + datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        self.pending.append((row_index, status, status_date, timestamp))
+        self.pending.append((row_index, status, status_date, timestamp, new_cust_id))
         if len(self.pending) >= self.batch_size:
             self.flush()
 
@@ -501,12 +628,14 @@ class StatusBatchWriter:
         from gspread.utils import rowcol_to_a1
 
         batch = []
-        for row_index, status, status_date, timestamp in self.pending:
+        for row_index, status, status_date, timestamp, new_cust_id in self.pending:
             batch.append({"range": rowcol_to_a1(row_index, self.status_col), "values": [[status]]})
             if self.date_col != -1:
                 batch.append({"range": rowcol_to_a1(row_index, self.date_col), "values": [[status_date]]})
             if self.time_col != -1:
                 batch.append({"range": rowcol_to_a1(row_index, self.time_col), "values": [[timestamp]]})
+            if new_cust_id and self.cust_id_col != -1:
+                batch.append({"range": rowcol_to_a1(row_index, self.cust_id_col), "values": [[new_cust_id]]})
 
         try:
             self.ws.batch_update(batch, value_input_option="USER_ENTERED")
@@ -908,17 +1037,64 @@ async def check_all_statuses(
 
         try:
             results = await query_subs_page_tree(target, csrf_token, cust_id)
-            status, status_date = match_status_from_api(results)
-            display_status = status if status else "-"
-            print(f"    {len(results)} entries -> {display_status} ({status_date})")
+            print(f"    {len(results)} subscriber entries")
+
+            # Fallback: if all results are inactive (Transfer Out / Terminated),
+            # try IC lookup to find a newer custId with active service
+            updated_cust_id = ""  # Track if we found a new custId
+            if _all_inactive(results):
+                # Use IC number from the first order that has one
+                ic_field = ""
+                name = ""
+                for o in group_orders:
+                    if o.get("ic_number"):
+                        ic_field = o["ic_number"]
+                        name = o.get("name", "")
+                        break
+
+                if ic_field:
+                    cert_number, cert_type = parse_ic_number(ic_field)
+                    if cert_number:
+                        print(f"    All inactive — trying IC lookup: {cert_number} ({cert_type})")
+                        ic_results = await query_subscriber_api(
+                            page, target, csrf_token, cert_number, cert_type, name
+                        )
+                        if ic_results:
+                            # Find new custIds from IC lookup
+                            new_cust_ids = set()
+                            for r in ic_results:
+                                new_cid = r.get("custId", "")
+                                if new_cid and new_cid != cust_id:
+                                    new_cust_ids.add(new_cid)
+
+                            # Prefer non-10XXX custIds (10XXX is the old format)
+                            new_cust_ids = sorted(
+                                new_cust_ids,
+                                key=lambda x: (x.startswith("10"), x),
+                            )
+
+                            # Query each new custId and collect results
+                            for new_cid in new_cust_ids:
+                                new_results = await query_subs_page_tree(target, csrf_token, new_cid)
+                                if new_results and not _all_inactive(new_results):
+                                    print(f"    Found active custId: {new_cid} ({len(new_results)} entries)")
+                                    results = new_results
+                                    updated_cust_id = new_cid
+                                    break
 
             for order in group_orders:
-                writer.add(order["row_index"], status, status_date)
+                order_addr = order.get("address", "")
+                status, status_date = match_status_from_api(results, order_address=order_addr)
+                display_status = status if status else "-"
+                print(f"    {order['order_number']} -> {display_status} ({status_date})")
+                if updated_cust_id:
+                    print(f"    Cust ID updated: {cust_id} -> {updated_cust_id}")
+                writer.add(order["row_index"], status, status_date, new_cust_id=updated_cust_id)
 
-            if status == "Not Found":
-                not_found += 1
-            else:
-                checked += 1
+                if status == "Not Found":
+                    not_found += 1
+                else:
+                    checked += 1
 
         except Exception as e:
             print(f"    Error: {e}")

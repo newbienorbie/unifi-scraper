@@ -605,71 +605,63 @@ async def scrape_orders_month(
 
         page.on("response", intercept_response)
 
-        async def fetch_order_json_via_new_tab(order_id: str) -> dict:
-            # Open a lightweight tab for this order and capture the proven API response.
+        # Reusable detail page — created once, reused for all orders
+        detail_page = None
+
+        async def fetch_order_json_via_api(order_id: str) -> dict:
+            """Fetch order detail by reusing a single page (avoids creating/destroying pages)."""
+            nonlocal detail_page
             captured = {}
 
             async def _intercept(resp):
                 try:
-                    url = resp.url
-                    if "getCeeOrderDetail" in url and resp.status == 200:
-                        try:
-                            jd = await resp.json()
-                            if isinstance(jd, dict):
-                                data = jd.get("data", {})
-                                cust_nbr = (
-                                    data.get("custOrderNbr")
-                                    or data.get("orderId")
-                                    or ""
-                                )
-                                if str(cust_nbr).strip() == str(order_id).strip():
-                                    captured["json"] = jd
-                        except Exception:
-                            pass
+                    if "getCeeOrderDetail" in resp.url and resp.status == 200:
+                        jd = await resp.json()
+                        if isinstance(jd, dict):
+                            data = jd.get("data", {})
+                            cust_nbr = (
+                                data.get("custOrderNbr")
+                                or data.get("orderId")
+                                or ""
+                            )
+                            if str(cust_nbr).strip() == str(order_id).strip():
+                                captured["json"] = jd
                 except Exception:
                     pass
 
-            ctx = page.context
-            p = await ctx.new_page()
-            p.on("response", _intercept)
+            # Create the detail page once, reuse it for subsequent orders
+            if detail_page is None or detail_page.is_closed():
+                detail_page = await page.context.new_page()
 
-            max_attempts = 2
-            for attempt in range(1, max_attempts + 1):
+            detail_page.on("response", _intercept)
+
+            for attempt in range(1, 3):
                 try:
                     url = f"https://dealer.unifi.com.my/esales/h5/onBoarding/OrderDetails?custOrderId={order_id}&custOrderNbr={order_id}"
-                    await p.goto(url, wait_until="networkidle", timeout=90000)
+                    await detail_page.goto(url, wait_until="networkidle", timeout=90000)
 
-                    # Actively wait for the JSON to arrive (up to ~10s)
-                    for _ in range(20):  # 20 * 500ms = 10s
+                    for _ in range(20):
                         if "json" in captured:
                             break
-                        await p.wait_for_timeout(600)
+                        await detail_page.wait_for_timeout(600)
 
-                    # small extra buffer
-                    await p.wait_for_timeout(500)
+                    await detail_page.wait_for_timeout(500)
 
                     if "json" in captured:
-                        break  # success
+                        break
 
-                    if attempt < max_attempts:
-                        print(
-                            f"  ⚠️ Attempt {attempt} failed for {order_id}, retrying in 5s..."
-                        )
-                        await p.wait_for_timeout(5000)
+                    if attempt < 2:
+                        print(f"  ⚠️ Attempt {attempt} failed for {order_id}, retrying...")
+                        await detail_page.wait_for_timeout(3000)
 
                 except Exception as e:
-                    if attempt < max_attempts:
-                        print(
-                            f"  ⚠️ Attempt {attempt} error for {order_id}: {e}, retrying in 5s..."
-                        )
-                        await p.wait_for_timeout(5000)
+                    if attempt < 2:
+                        print(f"  ⚠️ Attempt {attempt} error for {order_id}: {e}, retrying...")
+                        await detail_page.wait_for_timeout(3000)
                     else:
                         print(f"  ❌ All attempts failed for {order_id}: {e}")
 
-            try:
-                await p.close()
-            except Exception:
-                pass
+            detail_page.remove_listener("response", _intercept)
 
             if "json" not in captured:
                 print(f"⚠️ No getCeeOrderDetail JSON captured for {order_id}")
@@ -882,7 +874,7 @@ async def scrape_orders_month(
                                 except Exception:
                                     overrides = {}
 
-                            api_json = await fetch_order_json_via_new_tab(order_id)
+                            api_json = await fetch_order_json_via_api(order_id)
                             # HARD GUARD: if no usable data, do NOT overwrite detail fields with blanks
                             if not isinstance(api_json, dict) or not api_json.get(
                                 "data"
@@ -1488,6 +1480,13 @@ async def scrape_orders_month(
         return result
 
     finally:
+        # Close the reusable detail page if it was created
+        try:
+            dp = locals().get("detail_page")
+            if dp and not dp.is_closed():
+                await dp.close()
+        except Exception:
+            pass
         await context.close()
         await browser.close()
         await pw.stop()
