@@ -1087,9 +1087,13 @@ async def check_all_statuses(
                 status, status_date = match_status_from_api(results, order_address=order_addr)
                 display_status = status if status else "-"
                 print(f"    {order['order_number']} -> {display_status} ({status_date})")
-                if updated_cust_id:
-                    print(f"    Cust ID updated: {cust_id} -> {updated_cust_id}")
-                writer.add(order["row_index"], status, status_date, new_cust_id=updated_cust_id)
+                # Only write new custId if it's not a downgrade (non-10XXX -> 10XXX)
+                write_cust_id = updated_cust_id
+                if write_cust_id and write_cust_id.startswith("10") and not cust_id.startswith("10"):
+                    write_cust_id = ""  # Don't overwrite newer format with old
+                if write_cust_id:
+                    print(f"    Cust ID updated: {cust_id} -> {write_cust_id}")
+                writer.add(order["row_index"], status, status_date, new_cust_id=write_cust_id)
 
                 if status == "Not Found":
                     not_found += 1
