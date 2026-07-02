@@ -2,8 +2,9 @@
 Daily job: scrape orders for last 6 months, then refresh statuses.
 
 1. Login once to establish/refresh session cache
-2. Run all 6 months in PARALLEL (each reuses cached session)
-3. Check statuses for all 6 months (single login session)
+2. Scrape all 6 months sequentially
+3. Update 10XXX custIds to newer ones via IC lookup
+4. Check statuses for all 6 months (single login session)
 """
 import asyncio
 import subprocess
@@ -15,6 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from check_custid import check_custids_multi_month
 from check_status import check_status_multi_month, get_last_n_months
 from credential_manager import CredentialManager
 from login_manager import login_and_get_context
@@ -96,8 +98,12 @@ async def main():
         status = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
         print(f"  {m} {y}: {status}")
 
-    # Step 3: Refresh statuses for all 6 months
-    print(f"\n=== STEP 3: Checking statuses for all {len(months)} months ===")
+    # Step 3: Update 10XXX custIds to newer ones
+    print(f"\n=== STEP 3: Updating 10XXX custIds for all {len(months)} months ===")
+    await check_custids_multi_month(username, password, months, write=True)
+
+    # Step 4: Refresh statuses for all 6 months
+    print(f"\n=== STEP 4: Checking statuses for all {len(months)} months ===")
     await check_status_multi_month(username, password, months)
 
     print(f"\n=== DAILY RUN COMPLETE: {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')} ===")
