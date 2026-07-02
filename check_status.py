@@ -227,7 +227,7 @@ def build_api_payload(
         "certTypeId": cert_type_id,
         "certNbr": cert_number,
         "custName": cust_name,
-        "showTerminatedSubs": "false",
+        "showTerminatedSubs": "true",
         "zsmart_dubbo_service_name": "QryCustInfoByParamsEx",
         "zsmart_fish_flag": True,
         "zsmart_referer_url": REFERER_URL,
