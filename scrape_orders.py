@@ -1416,13 +1416,63 @@ async def scrape_orders_month(
             except Exception as e:
                 print(f"⚠️ Warning: Could not sort tab: {e}")
 
-        # Run subscriber status check if enabled (sheets mode only)
+        # Run custId update + status check if enabled (sheets mode only)
         if check_status and output_format == "sheets":
+            # Step 1: Update 10XXX custIds to newer ones
             try:
-                from check_status import check_all_statuses
+                from check_custid import check_custids_for_month
+                from check_status import check_all_statuses, navigate_to_order_entry
 
+                print(f"\n🔄 Updating 10XXX custIds...")
+                iframe_frame = await navigate_to_order_entry(page)
+
+                # CSRF capture
+                captured_csrf = {}
+                async def _cap_csrf(route):
+                    csrf = route.request.headers.get("x-csrf-token", "")
+                    if csrf:
+                        captured_csrf["token"] = csrf
+                    await route.continue_()
+
+                await page.context.route("**/*", _cap_csrf)
+                try:
+                    await iframe_frame.evaluate("""() => {
+                        document.querySelectorAll('.modal-backdrop').forEach(el => el.remove());
+                        document.querySelectorAll('.comprivroot.ui-dialog').forEach(el => {
+                            const close = el.querySelector('.ui-dialog-titlebar-close, .close');
+                            if (close) close.click();
+                            else el.style.display = 'none';
+                        });
+                    }""")
+                    await page.wait_for_timeout(1000)
+                    await iframe_frame.locator("div.js-advanced-query-btn").first.click(force=True, timeout=15000)
+                    await page.wait_for_timeout(3000)
+                    await iframe_frame.locator('input[name="certNbr"]').first.fill("000000000000", timeout=10000)
+                    await page.wait_for_timeout(300)
+                    await iframe_frame.locator('input[name="custName"]').first.fill("TEST", timeout=5000)
+                    await page.wait_for_timeout(300)
+                    await iframe_frame.locator("button.js-query").first.click(force=True, timeout=5000)
+                    await page.wait_for_timeout(5000)
+                except Exception:
+                    pass
+                await page.context.unroute("**/*")
+                csrf_token = captured_csrf.get("token", "")
+
+                if csrf_token:
+                    await check_custids_for_month(
+                        page, iframe_frame, csrf_token, month_text, year, write=True, ws=ws
+                    )
+                else:
+                    print("  ⚠️ CSRF not captured — skipping custId update")
+            except Exception as e:
+                print(f"⚠️ Warning: CustId update failed: {e}")
+
+            # Step 2: Re-read the sheet (custIds may have changed) and check statuses
+            try:
                 print(f"\n🔍 Running subscriber status check...")
-                status_result = await check_all_statuses(page, month_text, year, ws)
+                # Re-open the worksheet to get fresh data after custId updates
+                ws = spread.worksheet(tab_title)
+                status_result = await check_all_statuses(page, month_text, year, ws, iframe_frame=iframe_frame)
                 print(f"  Status check complete: {status_result.get('checked', 0)} checked, "
                       f"{status_result.get('not_found', 0)} not found, "
                       f"{status_result.get('errors', 0)} errors")
