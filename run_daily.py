@@ -100,15 +100,31 @@ async def main():
 
     # Step 3: Update 10XXX custIds to newer ones
     print(f"\n=== STEP 3: Updating 10XXX custIds for all {len(months)} months ===")
-    try:
-        await check_custids_multi_month(username, password, months, write=True)
-    except Exception as e:
-        print(f"  ⚠️ CustId update failed: {e}")
-        print(f"  Continuing to status check...")
+    for attempt in range(1, 4):
+        try:
+            await check_custids_multi_month(username, password, months, write=True)
+            break
+        except Exception as e:
+            print(f"  ⚠️ CustId update attempt {attempt} failed: {e}")
+            if attempt < 3:
+                print(f"  Retrying with fresh login...")
+                await establish_session(username, password)
+            else:
+                print(f"  All attempts failed, continuing to status check...")
 
     # Step 4: Refresh statuses for all 6 months
     print(f"\n=== STEP 4: Checking statuses for all {len(months)} months ===")
-    await check_status_multi_month(username, password, months)
+    for attempt in range(1, 4):
+        try:
+            await check_status_multi_month(username, password, months)
+            break
+        except Exception as e:
+            print(f"  ⚠️ Status check attempt {attempt} failed: {e}")
+            if attempt < 3:
+                print(f"  Retrying with fresh login...")
+                await establish_session(username, password)
+            else:
+                print(f"  All attempts failed.")
 
     print(f"\n=== DAILY RUN COMPLETE: {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')} ===")
 
