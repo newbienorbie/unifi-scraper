@@ -100,7 +100,11 @@ async def main():
 
     # Step 3: Update 10XXX custIds to newer ones
     print(f"\n=== STEP 3: Updating 10XXX custIds for all {len(months)} months ===")
-    await check_custids_multi_month(username, password, months, write=True)
+    try:
+        await check_custids_multi_month(username, password, months, write=True)
+    except Exception as e:
+        print(f"  ⚠️ CustId update failed: {e}")
+        print(f"  Continuing to status check...")
 
     # Step 4: Refresh statuses for all 6 months
     print(f"\n=== STEP 4: Checking statuses for all {len(months)} months ===")
