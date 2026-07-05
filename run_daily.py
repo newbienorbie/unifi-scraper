@@ -3,10 +3,12 @@ Daily job: scrape orders for last 6 months, then refresh statuses.
 
 1. Login once to establish/refresh session cache
 2. Scrape all 6 months sequentially
-3. Update 10XXX custIds to newer ones via IC lookup
+3. Update 10XXX custIds (only if previous run found updates)
 4. Check statuses for all 6 months (single login session)
 """
 import asyncio
+import json
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -20,6 +22,8 @@ from check_custid import check_custids_multi_month
 from check_status import check_status_multi_month, get_last_n_months
 from credential_manager import CredentialManager
 from login_manager import login_and_get_context
+
+CUSTID_STATE_FILE = os.path.join(os.path.dirname(__file__), "logs", "custid_state.json")
 
 LOCAL_TZ = ZoneInfo("Asia/Kuala_Lumpur")
 
@@ -98,19 +102,55 @@ async def main():
         status = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
         print(f"  {m} {y}: {status}")
 
-    # Step 3: Update 10XXX custIds to newer ones
-    print(f"\n=== STEP 3: Updating 10XXX custIds for all {len(months)} months ===")
-    for attempt in range(1, 4):
+    # Step 3: Update 10XXX custIds (skip if previous run found 0 updates)
+    skip_custid = False
+    try:
+        if os.path.exists(CUSTID_STATE_FILE):
+            with open(CUSTID_STATE_FILE) as f:
+                state = json.load(f)
+            if state.get("last_updated", 0) == 0 and state.get("runs_since_update", 0) >= 3:
+                skip_custid = True
+    except Exception:
+        pass
+
+    if skip_custid:
+        print(f"\n=== STEP 3: Skipping custId check (no updates in last 3 runs) ===")
+    else:
+        print(f"\n=== STEP 3: Updating 10XXX custIds for all {len(months)} months ===")
+        total_updated = 0
+        for attempt in range(1, 4):
+            try:
+                results = await check_custids_multi_month(username, password, months, write=True)
+                total_updated = sum(
+                    r.get("updated", 0) for r in results.values() if isinstance(r, dict) and "updated" in r
+                )
+                break
+            except Exception as e:
+                print(f"  ⚠️ CustId update attempt {attempt} failed: {e}")
+                if attempt < 3:
+                    print(f"  Retrying with fresh login...")
+                    await establish_session(username, password)
+                else:
+                    print(f"  All attempts failed, continuing to status check...")
+
+        # Save state for next run
         try:
-            await check_custids_multi_month(username, password, months, write=True)
-            break
-        except Exception as e:
-            print(f"  ⚠️ CustId update attempt {attempt} failed: {e}")
-            if attempt < 3:
-                print(f"  Retrying with fresh login...")
-                await establish_session(username, password)
-            else:
-                print(f"  All attempts failed, continuing to status check...")
+            prev_runs = 0
+            if os.path.exists(CUSTID_STATE_FILE):
+                with open(CUSTID_STATE_FILE) as f:
+                    prev_runs = json.load(f).get("runs_since_update", 0)
+            with open(CUSTID_STATE_FILE, "w") as f:
+                json.dump({
+                    "last_updated": total_updated,
+                    "runs_since_update": 0 if total_updated > 0 else prev_runs + 1,
+                    "last_run": datetime.now(LOCAL_TZ).isoformat(),
+                }, f)
+        except Exception:
+            pass
+
+    # Cooldown before status check (avoid Google Sheets rate limits)
+    print(f"\n  Waiting 60s before status check...")
+    await asyncio.sleep(60)
 
     # Step 4: Refresh statuses for all 6 months
     print(f"\n=== STEP 4: Checking statuses for all {len(months)} months ===")
