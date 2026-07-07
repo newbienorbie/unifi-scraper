@@ -310,7 +310,7 @@ async def check_existing_orders_with_dates(
                 last_synced = row[ls_idx].strip() if len(row) > ls_idx else ""
             except ValueError:
                 # Fallback to your original hardcoded index if header missing
-                last_synced = row[12].strip() if len(row) > 12 and row[12] else ""
+                last_synced = row[13].strip() if len(row) > 13 and row[13] else ""
 
             if last_synced.strip():
                 last_synced_dt = parse_last_synced(last_synced)
@@ -758,6 +758,11 @@ async def scrape_orders_month(
                                 continue
 
                             # Get UI metadata
+                            event_type = (
+                                (await cells[1].text_content()).strip()
+                                if len(cells) > 1
+                                else ""
+                            )
                             order_status = (
                                 (await cells[3].text_content()).strip()
                                 if len(cells) > 3
@@ -843,6 +848,13 @@ async def scrape_orders_month(
                                             )
                                             if not _id:
                                                 continue
+                                            _event_type = (
+                                                (
+                                                    (await tds[1].text_content()) or ""
+                                                ).strip()
+                                                if len(tds) > 1
+                                                else ""
+                                            )
                                             _status = (
                                                 (
                                                     (await tds[3].text_content()) or ""
@@ -865,6 +877,7 @@ async def scrape_orders_month(
                                                 else ""
                                             )
                                             overrides[_id] = {
+                                                "Event Type": _event_type,
                                                 "Order Status": _status,
                                                 "Created Date": _created,
                                                 "Updated Date": _updated,
@@ -1080,6 +1093,7 @@ async def scrape_orders_month(
 
                             row_data = {
                                 "Order Number": order_id,
+                                "Event Type": event_type,
                                 "Order Status": order_status,
                                 "Created Date": created_date,
                                 "Updated Date": updated_date,
@@ -1320,8 +1334,8 @@ async def scrape_orders_month(
                     if not row:
                         continue
 
-                    order_status = row[1].strip() if len(row) > 1 and row[1] else ""
-                    last_synced = row[12].strip() if len(row) > 12 and row[12] else ""
+                    order_status = row[2].strip() if len(row) > 2 and row[2] else ""
+                    last_synced = row[13].strip() if len(row) > 13 and row[13] else ""
 
                     # Only count rows that have a Last Synced value
                     if last_synced:

@@ -9,6 +9,7 @@ from gspread.utils import rowcol_to_a1
 # UPDATED HEADERS with Org Code and Organization Name
 HEADERS = [
     "Order Number",
+    "Event Type",
     "Order Status",
     "Created Date",
     "Updated Date",
