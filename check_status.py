@@ -556,17 +556,51 @@ def _package_match_score(order_pkg: str, entry: Dict) -> float:
 
 def match_status_from_api(results: List[Dict], order_address: str = "", order_package: str = "") -> Tuple[str, str]:
     """
-    Find the subscriber status from API results by matching address + package.
-    If multiple subscribers share the same address, use package name as tiebreaker.
-    Falls back to first entry with status if no match found.
+    Find the subscriber status from API results.
+    Priority: package match first (identifies the service), address as tiebreaker.
+    A customer can move addresses but the package stays the same.
     Returns (status, status_date) tuple.
     """
     if not results:
         return "Not Found", ""
 
-    # If we have an order address, try to match by address (+ package as tiebreaker)
+    # Step 1: Find entries matching the package
+    if order_package:
+        pkg_matches = []
+        for r in results:
+            pkg_score = _package_match_score(order_package, r)
+            status = _get_status(r)
+            if pkg_score > 0.5 and status:
+                pkg_matches.append((r, pkg_score))
+
+        if pkg_matches:
+            # If multiple package matches, use address as tiebreaker
+            if len(pkg_matches) > 1 and order_address:
+                best_match = None
+                best_addr_score = -1.0
+                for r, pkg_score in pkg_matches:
+                    addr_score = _address_match_score(order_address, _get_entry_address(r))
+                    if addr_score > best_addr_score:
+                        best_addr_score = addr_score
+                        best_match = r
+
+                if best_match:
+                    status = _get_status(best_match)
+                    date = _extract_status_date(best_match)
+                    plan = best_match.get("subsPlanName", "")
+                    print(f"    Matched by package + address: {plan[:50]}")
+                    return status, date
+
+            # Single package match or no address — use best package match
+            best_r, best_score = max(pkg_matches, key=lambda x: x[1])
+            status = _get_status(best_r)
+            date = _extract_status_date(best_r)
+            plan = best_r.get("subsPlanName", "")
+            print(f"    Matched by package: {plan[:50]}")
+            return status, date
+
+    # Step 2: No package match — fall back to address matching
     if order_address:
-        # Score all entries by address
         addr_matches = []
         for r in results:
             entry_addr = _get_entry_address(r)
@@ -578,55 +612,26 @@ def match_status_from_api(results: List[Dict], order_address: str = "", order_pa
                 addr_matches.append((r, addr_score))
 
         if addr_matches:
-            # If multiple entries match the same address, use package to pick the right one
-            if len(addr_matches) > 1 and order_package:
-                best_match = None
-                best_pkg_score = -1.0
-                for r, addr_score in addr_matches:
-                    pkg_score = _package_match_score(order_package, r)
-                    if pkg_score > best_pkg_score:
-                        best_pkg_score = pkg_score
-                        best_match = r
-
-                if best_match and best_pkg_score > 0:
-                    status = _get_status(best_match)
-                    date = _extract_status_date(best_match)
-                    plan = best_match.get("subsPlanName", "")
-                    print(f"    Matched by address + package: {plan[:50]}")
-                    return status, date
-
-            # Single address match or no package match — use best address match
-            best_r, best_score = addr_matches[0]
+            best_r, best_score = max(addr_matches, key=lambda x: x[1])
             status = _get_status(best_r)
             date = _extract_status_date(best_r)
             entry_addr = _get_entry_address(best_r)
-            print(f"    Address matched (score={best_score:.2f}): {entry_addr[:60]}")
+            print(f"    Matched by address (score={best_score:.2f}): {entry_addr[:60]}")
             return status, date
-
-        elif order_address and len(results) > 1:
+        else:
             entry_addrs = [_get_entry_address(r) for r in results if _get_entry_address(r)]
-            if entry_addrs:
+            if entry_addrs and len(results) > 1:
                 print(f"    No address match found (order: {order_address[:50]}...)")
                 for ea in entry_addrs[:3]:
                     print(f"      vs: {ea[:60]}")
 
-    # Fallback: match by package only if available
-    if order_package:
-        for r in results:
-            if _package_match_score(order_package, r) > 0.5 and _get_status(r):
-                status = _get_status(r)
-                date = _extract_status_date(r)
-                print(f"    Matched by package: {r.get('subsPlanName', '')[:50]}")
-                return status, date
-
-    # Last fallback: first entry with a non-empty status
+    # Step 3: Last fallback — first entry with a non-empty status
     for r in results:
         status = _get_status(r)
         if status:
             date = _extract_status_date(r)
             return status, date
 
-    # All entries have empty status
     return "", ""
 
 
