@@ -367,8 +367,11 @@ def sort_tab_by_created_date(ws, descending=True):
         header = all_values[0]
         data_rows = all_values[1:]
 
-        # Find Created Date column index (should be column C = index 2)
-        created_date_idx = 2  # "Created Date" is 3rd column (0-indexed = 2)
+        # Find Created Date column index by header name
+        try:
+            created_date_idx = header.index("Created Date")
+        except ValueError:
+            created_date_idx = 2  # fallback
 
         # Sort data rows by Created Date
         # Parse dates for proper sorting
