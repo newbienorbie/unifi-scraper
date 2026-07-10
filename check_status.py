@@ -562,11 +562,21 @@ def _get_entry_address(entry: Dict) -> str:
     return ""
 
 
+# Packages that should be treated as equivalent
+_PACKAGE_ALIASES = {
+    "uni5g postpaid 39": "uni5g postpaid 99",
+}
+
+
 def _package_match_score(order_pkg: str, entry: Dict) -> float:
     """Check if the order package matches a subscriber entry's plan name."""
     if not order_pkg:
         return 0.0
     order_pkg_lower = order_pkg.lower()
+    # Check aliases
+    alias = _PACKAGE_ALIASES.get(order_pkg_lower)
+    if alias:
+        order_pkg_lower = alias
     # Check subsPlanName (e.g. "Unifi Home 100Mbps Premium Value (36M)")
     plan = (entry.get("subsPlanName") or "").lower()
     if plan and order_pkg_lower in plan or plan in order_pkg_lower:
