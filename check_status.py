@@ -1183,14 +1183,14 @@ async def check_all_statuses(
 
                 status, status_date = match_status_from_api(order_results, order_address=order_addr, order_package=order_pkg)
 
-                # If no package match found and status looks wrong, try IC lookup
-                # to find the service under a different custId
+                # If status is inactive, try IC lookup to find the service under a different custId
                 if order_pkg and status in ("Terminated", "Transfer Out", "Not Found", "No Matching Package", ""):
-                    # Check if any result actually matches the package
-                    has_pkg_match = any(
-                        _package_match_score(order_pkg, r) > 0.5 for r in order_results
+                    # Only skip IC lookup if there's an Active package match already
+                    has_active_pkg_match = any(
+                        _package_match_score(order_pkg, r) > 0.5 and _get_status(r) == "Active"
+                        for r in order_results
                     )
-                    if not has_pkg_match:
+                    if not has_active_pkg_match:
                         ic_field = order.get("ic_number", "")
                         name = order.get("name", "")
                         if ic_field:
@@ -1210,7 +1210,7 @@ async def check_all_statuses(
                                                 new_status, new_date = match_status_from_api(
                                                     new_subs, order_address=order_addr, order_package=order_pkg
                                                 )
-                                                if new_status and new_status not in ("Not Found", ""):
+                                                if new_status == "Active":
                                                     status = new_status
                                                     status_date = new_date
                                                     order_updated_cust_id = new_cid
