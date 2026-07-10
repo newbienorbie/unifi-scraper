@@ -642,6 +642,8 @@ class StatusBatchWriter:
         self.ws = ws
         self.batch_size = batch_size
         self.pending = []
+        self.write_failures = 0
+        self.write_errors = []
 
         try:
             self.status_col = headers.index("Status") + 1  # 1-based
@@ -693,7 +695,11 @@ class StatusBatchWriter:
         try:
             self.ws.batch_update(batch, value_input_option="USER_ENTERED")
         except Exception as e:
-            print(f"    Batch write error: {e}")
+            self.write_failures += len(self.pending)
+            err_msg = str(e)
+            if err_msg not in self.write_errors:
+                self.write_errors.append(err_msg)
+            print(f"    Batch write error ({len(self.pending)} rows): {e}")
 
         self.pending = []
 
@@ -1170,6 +1176,10 @@ async def check_all_statuses(
     print(f"  Status found: {checked}")
     print(f"  Not Found: {not_found}")
     print(f"  Errors: {errors}")
+    if writer.write_failures > 0:
+        print(f"  ⚠️ WRITE FAILURES: {writer.write_failures} rows failed to save!")
+        for err in writer.write_errors:
+            print(f"    -> {err[:100]}")
     print("=" * 70)
 
     return {
@@ -1177,6 +1187,7 @@ async def check_all_statuses(
         "checked": checked,
         "not_found": not_found,
         "errors": errors,
+        "write_failures": writer.write_failures,
     }
 
 
