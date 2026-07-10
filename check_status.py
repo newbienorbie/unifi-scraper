@@ -1179,7 +1179,7 @@ async def check_all_statuses(
 
                 # If no package match found and status looks wrong, try IC lookup
                 # to find the service under a different custId
-                if order_pkg and status in ("Terminated", "Transfer Out", "Not Found", ""):
+                if order_pkg and status in ("Terminated", "Transfer Out", "Not Found", "No Matching Package", ""):
                     # Check if any result actually matches the package
                     has_pkg_match = any(
                         _package_match_score(order_pkg, r) > 0.5 for r in order_results
