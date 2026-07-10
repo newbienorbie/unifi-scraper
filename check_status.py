@@ -600,25 +600,17 @@ def match_status_from_api(results: List[Dict], order_address: str = "", order_pa
                 pkg_matches.append((r, pkg_score))
 
         if pkg_matches:
-            # If multiple package matches, use address as tiebreaker
-            if len(pkg_matches) > 1 and order_address:
-                best_match = None
-                best_addr_score = -1.0
-                for r, pkg_score in pkg_matches:
-                    addr_score = _address_match_score(order_address, _get_entry_address(r))
-                    if addr_score > best_addr_score:
-                        best_addr_score = addr_score
-                        best_match = r
+            if len(pkg_matches) > 1:
+                # Sort by: address score (desc), then prefer Active over inactive
+                def _rank(item):
+                    r, pkg_score = item
+                    addr_score = _address_match_score(order_address, _get_entry_address(r)) if order_address else 0
+                    is_active = 1 if _get_status(r) == "Active" else 0
+                    return (addr_score, is_active)
 
-                if best_match:
-                    status = _get_status(best_match)
-                    date = _extract_status_date(best_match)
-                    plan = best_match.get("subsPlanName", "")
-                    print(f"    Matched by package + address: {plan[:50]}")
-                    return status, date
+                pkg_matches.sort(key=_rank, reverse=True)
 
-            # Single package match or no address — use best package match
-            best_r, best_score = max(pkg_matches, key=lambda x: x[1])
+            best_r, best_score = pkg_matches[0]
             status = _get_status(best_r)
             date = _extract_status_date(best_r)
             plan = best_r.get("subsPlanName", "")
