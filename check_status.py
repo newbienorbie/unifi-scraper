@@ -562,11 +562,6 @@ def _get_entry_address(entry: Dict) -> str:
     return ""
 
 
-# Packages that should be treated as equivalent (both directions)
-_PACKAGE_EQUIVALENTS = [
-    ("uni5g postpaid 39", "uni5g postpaid 99"),
-]
-
 
 def _package_match_score(order_pkg: str, entry: Dict) -> float:
     """Check if the order package matches a subscriber entry's plan name."""
@@ -581,14 +576,11 @@ def _package_match_score(order_pkg: str, entry: Dict) -> float:
     offer = (entry.get("offerName") or "").lower()
     if offer and order_pkg_lower in offer or offer in order_pkg_lower:
         return 0.8
-    # Check equivalent packages (e.g. UNI5G Postpaid 39 ↔ UNI5G Postpaid 99)
-    for pkg_a, pkg_b in _PACKAGE_EQUIVALENTS:
-        if order_pkg_lower == pkg_a or order_pkg_lower == pkg_b:
-            equiv = pkg_b if order_pkg_lower == pkg_a else pkg_a
-            if plan and (equiv in plan or plan in equiv):
-                return 0.9
-            if offer and (equiv in offer or offer in equiv):
-                return 0.7
+    # Treat all UNI5G Postpaid variants as equivalent (39, 69, 99, etc.)
+    if order_pkg_lower.startswith("uni5g postpaid") and plan.startswith("uni5g postpaid"):
+        return 0.9
+    if order_pkg_lower.startswith("uni5g postpaid") and offer.startswith("uni5g postpaid"):
+        return 0.7
     # Word overlap
     pkg_words = set(order_pkg_lower.split())
     plan_words = set(plan.split())
