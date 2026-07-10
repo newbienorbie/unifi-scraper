@@ -648,7 +648,12 @@ def match_status_from_api(results: List[Dict], order_address: str = "", order_pa
                 for ea in entry_addrs[:3]:
                     print(f"      vs: {ea[:60]}")
 
-    # Step 3: Last fallback — first entry with a non-empty status
+    # If we had a package to match but nothing matched, don't pick an unrelated service
+    if order_package and results:
+        print(f"    No matching package found for: {order_package[:50]}")
+        return "No Matching Package", ""
+
+    # Step 3: Last fallback — first entry with a non-empty status (only when no package specified)
     for r in results:
         status = _get_status(r)
         if status:
