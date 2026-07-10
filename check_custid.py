@@ -170,22 +170,22 @@ async def check_custids_for_month(
                     new_cust_ids.add(cid)
 
             if new_cust_ids:
-                # Prefer one with active subscribers, but use any non-10XXX if all inactive
+                # Only write if the new custId actually has subscriber results
                 best_new = None
                 for new_cid in sorted(new_cust_ids):
                     subs = await query_subs_page_tree(target, csrf_token, new_cid)
-                    if subs and not _all_inactive(subs):
+                    if subs:
                         best_new = new_cid
                         break
 
-                # If no active one found, just use the first non-10XXX custId
-                if not best_new:
-                    best_new = sorted(new_cust_ids)[0]
-
-                print(f" -> {best_new} ✓")
-                updated += 1
-                for order in group:
-                    updates.append((order["row_index"], old_cust_id, best_new))
+                if best_new:
+                    print(f" -> {best_new} ✓")
+                    updated += 1
+                    for order in group:
+                        updates.append((order["row_index"], old_cust_id, best_new))
+                else:
+                    print(f" -> new IDs found but no subscriber data")
+                    same += 1
             else:
                 print(" -> same")
                 same += 1
