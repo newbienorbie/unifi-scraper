@@ -38,7 +38,7 @@ CERT_TYPE_ID_MAP = {
     "I-KAD": "10",
     "Internal Division ID": "11",
     "MyKAS": "12",
-    "MyTentera": "3",
+    "MyTentera": "2",
     "MyPR": "14",
     "Prospect Customer": "7",
     "Without NRIC": "15",
