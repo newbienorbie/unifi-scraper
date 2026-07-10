@@ -562,10 +562,10 @@ def _get_entry_address(entry: Dict) -> str:
     return ""
 
 
-# Packages that should be treated as equivalent
-_PACKAGE_ALIASES = {
-    "uni5g postpaid 39": "uni5g postpaid 99",
-}
+# Packages that should be treated as equivalent (both directions)
+_PACKAGE_EQUIVALENTS = [
+    ("uni5g postpaid 39", "uni5g postpaid 99"),
+]
 
 
 def _package_match_score(order_pkg: str, entry: Dict) -> float:
@@ -573,10 +573,6 @@ def _package_match_score(order_pkg: str, entry: Dict) -> float:
     if not order_pkg:
         return 0.0
     order_pkg_lower = order_pkg.lower()
-    # Check aliases
-    alias = _PACKAGE_ALIASES.get(order_pkg_lower)
-    if alias:
-        order_pkg_lower = alias
     # Check subsPlanName (e.g. "Unifi Home 100Mbps Premium Value (36M)")
     plan = (entry.get("subsPlanName") or "").lower()
     if plan and order_pkg_lower in plan or plan in order_pkg_lower:
@@ -585,6 +581,14 @@ def _package_match_score(order_pkg: str, entry: Dict) -> float:
     offer = (entry.get("offerName") or "").lower()
     if offer and order_pkg_lower in offer or offer in order_pkg_lower:
         return 0.8
+    # Check equivalent packages (e.g. UNI5G Postpaid 39 ↔ UNI5G Postpaid 99)
+    for pkg_a, pkg_b in _PACKAGE_EQUIVALENTS:
+        if order_pkg_lower == pkg_a or order_pkg_lower == pkg_b:
+            equiv = pkg_b if order_pkg_lower == pkg_a else pkg_a
+            if plan and (equiv in plan or plan in equiv):
+                return 0.9
+            if offer and (equiv in offer or offer in equiv):
+                return 0.7
     # Word overlap
     pkg_words = set(order_pkg_lower.split())
     plan_words = set(plan.split())
