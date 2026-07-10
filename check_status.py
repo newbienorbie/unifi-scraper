@@ -1170,11 +1170,48 @@ async def check_all_statuses(
             for order in group_orders:
                 order_addr = order.get("address", "")
                 order_pkg = order.get("package", "")
-                status, status_date = match_status_from_api(results, order_address=order_addr, order_package=order_pkg)
+                order_results = results
+                order_updated_cust_id = updated_cust_id
+
+                status, status_date = match_status_from_api(order_results, order_address=order_addr, order_package=order_pkg)
+
+                # If no package match found and status looks wrong, try IC lookup
+                # to find the service under a different custId
+                if order_pkg and status in ("Terminated", "Transfer Out", "Not Found", ""):
+                    # Check if any result actually matches the package
+                    has_pkg_match = any(
+                        _package_match_score(order_pkg, r) > 0.5 for r in order_results
+                    )
+                    if not has_pkg_match:
+                        ic_field = order.get("ic_number", "")
+                        name = order.get("name", "")
+                        if ic_field:
+                            cert_number, cert_type = parse_ic_number(ic_field)
+                            if cert_number:
+                                print(f"    No package match — trying IC lookup: {cert_number}")
+                                ic_results = await query_subscriber_api(
+                                    page, target, csrf_token, cert_number, cert_type, name
+                                )
+                                if ic_results:
+                                    # Find custIds that have the matching package
+                                    for r in ic_results:
+                                        new_cid = r.get("custId", "")
+                                        if new_cid and new_cid != cust_id:
+                                            new_subs = await query_subs_page_tree(target, csrf_token, new_cid)
+                                            if new_subs:
+                                                new_status, new_date = match_status_from_api(
+                                                    new_subs, order_address=order_addr, order_package=order_pkg
+                                                )
+                                                if new_status and new_status not in ("Not Found", ""):
+                                                    status = new_status
+                                                    status_date = new_date
+                                                    order_updated_cust_id = new_cid
+                                                    break
+
                 display_status = status if status else "-"
                 print(f"    {order['order_number']} -> {display_status} ({status_date})")
                 # Only write new custId if it's not a downgrade (non-10XXX -> 10XXX)
-                write_cust_id = updated_cust_id
+                write_cust_id = order_updated_cust_id
                 if write_cust_id and write_cust_id.startswith("10") and not cust_id.startswith("10"):
                     write_cust_id = ""  # Don't overwrite newer format with old
                 if write_cust_id:
