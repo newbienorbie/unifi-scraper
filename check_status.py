@@ -333,10 +333,10 @@ async def query_subscriber_api(
 SUBS_PAGE_TREE_URL = "https://dealer.unifi.com.my/esales/FishModule/crm/api/subs/qrySubsPageTree"
 
 
-async def query_subs_page_tree(target, csrf_token: str, cust_id: str) -> List[Dict]:
+async def _query_subs_page(target, csrf_token: str, cust_id: str, page_index: int = 1, page_count: int = 50) -> Tuple[List[Dict], bool]:
     """
-    Query subscriber page tree by custId to get actual prodStateName.
-    Used as fallback when QryCustInfoByParamsEx returns empty status.
+    Query a single page of subscriber results.
+    Returns (subs_list, has_more).
     """
     payload = {
         "requestParam": {
@@ -344,8 +344,8 @@ async def query_subs_page_tree(target, csrf_token: str, cust_id: str) -> List[Di
             "PAGE_REQ": {
                 "COUNT_FLAG": "N",
                 "PAGE_MODE": "S",
-                "pageIndex": 1,
-                "pageCount": 50,
+                "pageIndex": page_index,
+                "pageCount": page_count,
             },
         }
     }
@@ -375,30 +375,56 @@ async def query_subs_page_tree(target, csrf_token: str, cust_id: str) -> List[Di
         )
 
         if not result.get("success"):
-            return []
+            return [], False
 
         data = result.get("data", {})
         if not data.get("isSuccess"):
-            return []
+            return [], False
 
         subs_list = data.get("subsList", []) or []
+        has_more = len(subs_list) >= page_count
 
-        # Log available fields on first result for debugging
-        if subs_list and not hasattr(query_subs_page_tree, "_logged_fields"):
+        return subs_list, has_more
+
+    except Exception:
+        return [], False
+
+
+async def query_subs_page_tree(target, csrf_token: str, cust_id: str) -> List[Dict]:
+    """
+    Query subscriber page tree by custId. Paginates automatically if more than 50 results.
+    """
+    all_subs = []
+    page_index = 1
+    max_pages = 10  # Safety limit
+
+    while page_index <= max_pages:
+        subs, has_more = await _query_subs_page(target, csrf_token, cust_id, page_index)
+
+        if not subs:
+            break
+
+        # Log fields on first result
+        if page_index == 1 and not hasattr(query_subs_page_tree, "_logged_fields"):
             query_subs_page_tree._logged_fields = True
-            sample = subs_list[0]
+            sample = subs[0]
             print(f"    [DEBUG] subsList entry keys: {list(sample.keys())}")
-            # Log address-related fields
             addr_keys = [k for k in sample.keys() if "addr" in k.lower() or "address" in k.lower() or "install" in k.lower()]
             if addr_keys:
                 print(f"    [DEBUG] Address-related fields: {addr_keys}")
                 for k in addr_keys:
                     print(f"    [DEBUG]   {k} = {sample.get(k, '')!r}")
 
-        return subs_list
+        all_subs.extend(subs)
 
-    except Exception:
-        return []
+        if not has_more:
+            break
+
+        page_index += 1
+        if page_index > 1:
+            print(f"    Fetching page {page_index} ({len(all_subs)} entries so far)")
+
+    return all_subs
 
 
 async def query_via_order_detail(target, context, csrf_token: str, order_id: str) -> List[Dict]:
