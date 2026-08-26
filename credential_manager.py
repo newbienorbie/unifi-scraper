@@ -2,6 +2,7 @@
 Secure credential management with encryption
 """
 
+import force_ipv4  # noqa: F401  # prefer IPv4 (fixes IPv6-stall hangs on Google API calls)
 import json
 import os
 

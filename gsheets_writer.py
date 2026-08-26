@@ -53,6 +53,9 @@ def open_sheet():
     if not sid:
         raise RuntimeError("GOOGLE_SHEETS_SPREADSHEET_ID not set")
     gc = gspread.service_account(filename="service_account.json")
+    # Without a timeout, a slow/hung Sheets API call blocks forever (read timeout=None).
+    # Cap it so requests fail fast and the caller's retry/backoff can recover.
+    gc.set_timeout(120)
     return gc.open_by_key(sid)
 
 

@@ -18,6 +18,13 @@ SESSION_PATH = "sessions/session_cache.json"
 
 STEALTH_SCRIPT = """
 (function() {
+    // fishx references a global trackSensors() (sensor telemetry) that is never
+    // defined in our automated context, so its axios response interceptor throws
+    // on every FishModule API call and the Order Entry form never renders. Its
+    // return value is unused, so a no-op stub fully satisfies it.
+    if (typeof window.trackSensors === 'undefined') {
+        window.trackSensors = function() {};
+    }
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     Object.defineProperty(navigator, 'plugins', { get: () => [
         { name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }
@@ -85,9 +92,9 @@ def _patch_script(body: str, url: str) -> str:
     fname = url.split("/")[-1]
 
     # 1. Kill the disable-devtool initialization block:
-    #    { disableMenu: !0, ..., clearLog: !0, ondevtoolopen: function() { window.location.href = "/esales/login" } }
+    #    function() { window.location.href = "..." } OR () => { window.location.href = "..." }
     body = re.sub(
-        r'ondevtoolopen:\s*function\s*\(\)\s*\{\s*window\.location\.href\s*=\s*["\'][^"\']*["\']\s*\}',
+        r'ondevtoolopen:\s*(?:function\s*\(\)|(?:\(\)\s*=>))\s*\{\s*window\.location\.href\s*=\s*["\'][^"\']*["\']\s*;?\s*\}',
         "ondevtoolopen: function() { /* patched */ }",
         body,
     )
@@ -206,7 +213,22 @@ async def _launch_browser_safe():
         print(f"🛡️ Blocked URL: {route.request.url}")
         await route.abort()
 
+    async def fix_fishmodule_module_path(route):
+        """FishModule's loader resolves module scripts to a bad doubled path
+        (.../FishModule/esales/modules/... → 404), which breaks the Order Entry
+        form. Refetch from the correct .../FishModule/modules/... path."""
+        url = route.request.url
+        fixed = url.replace("/FishModule/esales/modules/", "/FishModule/modules/")
+        try:
+            resp = await route.fetch(url=fixed)
+            body = await resp.body()
+            await route.fulfill(status=resp.status, headers=dict(resp.headers), body=body)
+        except Exception as e:
+            print(f"⚠️ FishModule path fix failed for {url}: {e}")
+            await route.continue_()
+
     await context.route("**/fishx*.js", handle_fishx_route)
+    await context.route("**/FishModule/esales/modules/**", fix_fishmodule_module_path)
     await context.route("**/*no-devtool*", block_anti_bot_urls)
     await context.route("**/*disable-devtool*", block_anti_bot_urls)
 
@@ -326,17 +348,28 @@ async def login_and_get_context(username: str, password: str):
     await page.fill("#login-form_staffCode", username)
     await page.fill("#login-form_password", password)
 
-    # --- Select OTP Channel (SMS) ---
+    # --- Select OTP Channel (Email) ---
+    # The portal renders this dropdown in Chinese on some loads (邮箱 = Email,
+    # 短信 = SMS) regardless of the En toggle, so match both languages.
+    # #login-form_channel is a hidden antd input — click the visible
+    # .ant-select-selector to actually open the menu.
     print("Selecting OTP Channel (Email)...")
     try:
-        channel_dropdown = page.locator("#login-form_channel")
-        if await channel_dropdown.count() == 0:
-            channel_dropdown = page.locator(".ant-select-selection-item").last
-        await channel_dropdown.click(force=True, timeout=5000)
-        await page.wait_for_timeout(1000)
-        await page.locator(
-            ".ant-select-item-option-content:has-text('Email')"
-        ).first.click(force=True, timeout=5000)
+        selector = page.locator("#login-form_channel").locator(
+            "xpath=ancestor::div[contains(@class,'ant-select-selector')][1]"
+        )
+        if await selector.count() == 0:
+            selector = page.locator(".ant-select-selector").last
+        await selector.click(force=True, timeout=5000)
+        await page.wait_for_selector(
+            ".ant-select-dropdown:not(.ant-select-dropdown-hidden)",
+            state="visible",
+            timeout=8000,
+        )
+        await page.wait_for_timeout(500)
+        await page.locator(".ant-select-item-option-content").filter(
+            has_text=re.compile(r"Email|邮箱", re.I)
+        ).first.click(force=True, timeout=8000)
         print("✅ Selected Email channel")
         await page.wait_for_timeout(1000)
     except Exception as e:
@@ -395,6 +428,84 @@ async def login_and_get_context(username: str, password: str):
 
     if otp:
         print(f"Using OTP: {otp}")
+
+        # Page may have reloaded after GET click — wait for form to be ready
+        print("Waiting for login form to stabilize...")
+        try:
+            await page.wait_for_selector(
+                "#login-form_staffCode", state="visible", timeout=15000
+            )
+        except Exception:
+            print("  ⚠️ Form not found, reloading login page...")
+            await page.goto(LOGIN_URL, timeout=45000, wait_until="domcontentloaded")
+            await page.wait_for_selector(
+                "#login-form_staffCode", state="visible", timeout=30000
+            )
+
+        # Wait for OTP field to appear
+        try:
+            await page.wait_for_selector(
+                "#login-form_smsCode", state="visible", timeout=15000
+            )
+        except Exception:
+            print("  ⚠️ OTP field not visible, waiting longer...")
+            await page.wait_for_timeout(5000)
+
+        # Re-fill form fields — page reload may clear some or all
+        staff_val = await page.input_value("#login-form_staffCode")
+        if not staff_val:
+            print("  Page was reloaded — re-filling username & password...")
+            await page.fill("#login-form_staffCode", username)
+        await page.fill("#login-form_password", password)
+
+        # Always re-select Email channel (dropdown resets on reload even if text fields survive).
+        # Match English "Email" or Chinese "邮箱" — the portal's language is inconsistent.
+        try:
+            item = page.locator(".ant-select-selection-item").last
+            channel_text = await item.inner_text() if await item.count() > 0 else ""
+            if "Email" not in channel_text and "邮箱" not in channel_text:
+                print("  Re-selecting Email channel...")
+                selector = page.locator("#login-form_channel").locator(
+                    "xpath=ancestor::div[contains(@class,'ant-select-selector')][1]"
+                )
+                if await selector.count() == 0:
+                    selector = page.locator(".ant-select-selector").last
+                await selector.click(force=True, timeout=5000)
+                await page.wait_for_selector(
+                    ".ant-select-dropdown:not(.ant-select-dropdown-hidden)",
+                    state="visible",
+                    timeout=8000,
+                )
+                await page.wait_for_timeout(500)
+                await page.locator(".ant-select-item-option-content").filter(
+                    has_text=re.compile(r"Email|邮箱", re.I)
+                ).first.click(force=True, timeout=8000)
+                await page.wait_for_timeout(500)
+        except Exception as e:
+            print(f"  ⚠️ Re-select channel: {e}")
+
+        # Always re-check checkboxes (they reset on reload)
+        try:
+            rm = page.locator("input#login-form_rememerMe")
+            if not await rm.is_checked():
+                await rm.check(force=True, timeout=3000)
+        except Exception:
+            pass
+        for sel in [
+            '.policy___1uV3w input[type="checkbox"]',
+            'div[class*="policy"] input[type="checkbox"]',
+            'input[type="checkbox"]:not(#login-form_rememerMe)',
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    if not await loc.is_checked():
+                        await loc.check(force=True, timeout=3000)
+                        print(f"  ✅ T&C re-checked")
+                    break
+            except Exception:
+                continue
+
         try:
             otp_field = page.locator("input#login-form_smsCode")
             await otp_field.wait_for(state="visible", timeout=15000)
@@ -406,6 +517,48 @@ async def login_and_get_context(username: str, password: str):
             raise RuntimeError(
                 f"Could not fill OTP field. Check logs/otp_fill_failed.png. Error: {e}"
             )
+
+        # Final verification — ensure all fields are filled before Sign In
+        final_staff = await page.input_value("#login-form_staffCode")
+        final_pass = await page.input_value("#login-form_password")
+        final_otp = await page.input_value("#login-form_smsCode")
+
+        tc_checked = False
+        for sel in [
+            '.policy___1uV3w input[type="checkbox"]',
+            'div[class*="policy"] input[type="checkbox"]',
+            'input[type="checkbox"]:not(#login-form_rememerMe)',
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    tc_checked = await loc.is_checked()
+                    break
+            except Exception:
+                continue
+
+        print(
+            f"  Pre-submit check: staff={'✅' if final_staff else '❌'} pass={'✅' if final_pass else '❌'} otp={'✅' if final_otp else '❌'} T&C={'✅' if tc_checked else '❌'}"
+        )
+        if not final_staff:
+            await page.fill("#login-form_staffCode", username)
+        if not final_pass:
+            await page.fill("#login-form_password", password)
+        if not final_otp:
+            await page.locator("input#login-form_smsCode").fill(otp, force=True)
+        if not tc_checked:
+            for sel in [
+                '.policy___1uV3w input[type="checkbox"]',
+                'div[class*="policy"] input[type="checkbox"]',
+                'input[type="checkbox"]:not(#login-form_rememerMe)',
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0:
+                        await loc.check(force=True, timeout=3000)
+                        break
+                except Exception:
+                    continue
 
         await page.screenshot(path="logs/before_sign_in.png")
         print("📸 Screenshot saved to logs/before_sign_in.png")
@@ -454,5 +607,4 @@ async def login_and_get_context(username: str, password: str):
         return browser, context, pw, page
     else:
         await browser.close()
-        raise RuntimeError("Failed to retrieve OTP from Telegram")
-        raise RuntimeError("Failed to retrieve OTP from Telegram")
+        raise RuntimeError("Failed to retrieve OTP from Email")

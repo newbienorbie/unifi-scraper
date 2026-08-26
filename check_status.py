@@ -6,6 +6,7 @@ Writes Status + Status Updated Time back to Google Sheet.
 """
 
 import re
+import time
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -21,6 +22,7 @@ except ImportError:
 LOCAL_TZ = ZoneInfo("Asia/Kuala_Lumpur") if ZoneInfo else None
 
 ORDER_ENTRY_URL = "https://dealer.unifi.com.my/esales/crm-TYMH100163"
+IFRAME_SELECTOR = "#myIframe"  # fixed id of the FishModule order-entry iframe
 API_URL = "https://dealer.unifi.com.my/esales/FishModule/cvbs/callservice.json?service=CallOcsDubboService&serviceName=QryCustInfoByParamsEx"
 
 # Map cert type names (from the sheet IC Number field) to certTypeId values
@@ -178,39 +180,71 @@ async def navigate_to_order_entry(page: Page):
     Navigate to Order Entry and open the Advanced Query form.
     Returns the iframe frame where the form lives.
     """
-    await page.goto(ORDER_ENTRY_URL, wait_until="networkidle", timeout=90000)
-    await page.wait_for_timeout(10000)
+    await page.goto(ORDER_ENTRY_URL, wait_until="domcontentloaded", timeout=90000)
+    await page.wait_for_timeout(3000)
 
-    # Find the iframe containing the form — retry for up to 60s
+    if "no-devtool" in page.url.lower() or "login" in page.url.lower():
+        print(f"  ⚠️ Landed on {page.url} — session invalid or anti-bot detector fired")
+
+    # Clear the 'Later'/announcement modal on the outer Ant shell FIRST — if left up
+    # it blocks the CCEntryView app inside the iframe from initializing. (bizzflow pattern)
+    try:
+        modal = page.locator(".ant-modal-wrap")
+        if await modal.count() > 0 and await modal.first.is_visible():
+            for sel in (
+                'button.ant-btn:has-text("Later")',
+                ".ant-modal-close",
+                'button.ant-btn:has-text("Cancel")',
+                'button.ant-btn:has-text("Close")',
+            ):
+                btn = page.locator(sel)
+                if await btn.count() > 0 and await btn.first.is_visible():
+                    await btn.first.click()
+                    await page.wait_for_timeout(800)
+                    print("  ✅ Cleared announcement modal")
+                    break
+    except Exception:
+        pass
+
+    # Get the order iframe by its fixed id (#myIframe) as a Frame object (needed for
+    # the API path's .evaluate()/fetch). The element appears well before its app renders.
     frame = page
-    for attempt in range(6):
+    try:
+        await page.wait_for_selector(IFRAME_SELECTOR, timeout=15000)
+        iframe_el = await page.query_selector(IFRAME_SELECTOR)
+        content = await iframe_el.content_frame() if iframe_el else None
+        if content:
+            frame = content
+    except Exception:
+        print(f"  ⚠️ {IFRAME_SELECTOR} never appeared; scanning frames by URL")
+
+    # Fallback: locate the FishModule frame by URL if #myIframe wasn't found.
+    if frame == page:
         for f in page.frames:
             if f == page.main_frame:
                 continue
-            try:
-                if await f.locator("div.js-advanced-query-btn").count() > 0:
-                    frame = f
-                    break
-            except Exception:
-                pass
-        if frame != page:
-            break
-        print(f"  Waiting for iframe to load... (attempt {attempt + 1}/6)")
-        await page.wait_for_timeout(10000)
+            if "remote.html" in f.url or "orderentry" in f.url.lower() or "FishModule" in f.url:
+                frame = f
+                break
 
-    # Wait for the >> button
+    # The CCEntryView app is slow + AJAX-heavy (~10s) and the iframe element appears
+    # long before its app renders. Wait up to 45s for the Advanced Query button — the
+    # real "app rendered" anchor the status flow needs. (bizzflow pattern)
+    app_ready = False
     try:
-        await frame.wait_for_selector("div.js-advanced-query-btn", state="attached", timeout=30000)
+        await frame.wait_for_selector("div.js-advanced-query-btn", state="attached", timeout=45000)
+        app_ready = True
+        print("  ✅ Order Entry app rendered (Advanced Query button present)")
     except Exception:
-        print("  >> button not found after waiting")
-        await page.wait_for_timeout(15000)
+        print("  >> Advanced Query button not found after 45s (API path will still run)")
 
-    # Open Advanced Query
-    try:
-        await frame.locator("div.js-advanced-query-btn").first.click(timeout=15000)
-        await page.wait_for_timeout(3000)
-    except Exception as e:
-        print(f"Error opening Advanced Query: {e}")
+    # Open Advanced Query (UI-form path)
+    if app_ready:
+        try:
+            await frame.locator("div.js-advanced-query-btn").first.click(timeout=8000)
+            await page.wait_for_timeout(3000)
+        except Exception as e:
+            print(f"  (Advanced Query open failed: {e})")
 
     return frame
 
@@ -672,7 +706,7 @@ def match_status_from_api(results: List[Dict], order_address: str = "", order_pa
 class StatusBatchWriter:
     """Collects status updates and flushes them in batches to avoid rate limits."""
 
-    def __init__(self, ws, headers: list, batch_size: int = 25):
+    def __init__(self, ws, headers: list, batch_size: int = 100):
         self.ws = ws
         self.batch_size = batch_size
         self.pending = []
@@ -726,14 +760,43 @@ class StatusBatchWriter:
             if new_cust_id and self.cust_id_col != -1:
                 batch.append({"range": rowcol_to_a1(row_index, self.cust_id_col), "values": [[new_cust_id]]})
 
-        try:
-            self.ws.batch_update(batch, value_input_option="USER_ENTERED")
-        except Exception as e:
+        # Retry with exponential backoff so a transient rate-limit (429),
+        # 5xx, or read-timeout doesn't permanently drop the whole batch.
+        from gspread.exceptions import APIError
+
+        max_attempts = 5
+        delay = 2
+        last_err = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.ws.batch_update(batch, value_input_option="USER_ENTERED")
+                last_err = None
+                break
+            except APIError as e:
+                last_err = e
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if code in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                    print(f"    ⏳ Sheets API {code}, retry {attempt}/{max_attempts - 1} in {delay}s...")
+                    time.sleep(delay)
+                    delay = min(delay * 2, 60)
+                    continue
+                break
+            except Exception as e:
+                # Network / read-timeout / connection errors — retry too.
+                last_err = e
+                if attempt < max_attempts:
+                    print(f"    ⏳ Sheets write error ({type(e).__name__}), retry {attempt}/{max_attempts - 1} in {delay}s...")
+                    time.sleep(delay)
+                    delay = min(delay * 2, 60)
+                    continue
+                break
+
+        if last_err is not None:
             self.write_failures += len(self.pending)
-            err_msg = str(e)
+            err_msg = str(last_err)
             if err_msg not in self.write_errors:
                 self.write_errors.append(err_msg)
-            print(f"    Batch write error ({len(self.pending)} rows): {e}")
+            print(f"    Batch write error ({len(self.pending)} rows) after {max_attempts} attempts: {last_err}")
 
         self.pending = []
 
