@@ -2,6 +2,7 @@
 login_manager.py - Resilient login with session cache and anti-bot stealth
 """
 
+import asyncio
 import json
 import os
 import re
@@ -10,11 +11,29 @@ import time
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
-from gmail_otp_reader import get_latest_otp
+from gmail_otp_reader import get_latest_otp as get_email_otp
+from telegram_otp_reader import get_latest_otp as get_sms_otp
 
 LOGIN_URL = "https://dealer.unifi.com.my/esales/login"
 HISTORY_URL = "https://dealer.unifi.com.my/esales/retailHistory"
 SESSION_PATH = "sessions/session_cache.json"
+
+# OTP channels, tried in this order. Each entry is how long to wait for a code
+# before giving up and falling through to the next channel.
+#
+# The email window has a hard floor: the portal re-enables its GET button only
+# 120s after a request, so falling back any sooner would re-select SMS and click
+# a still-disabled GET — the portal would never send the second code and we'd
+# wait out the SMS window for nothing. 150s clears that cooldown with ~30s of
+# margin. Do not lower it below ~130s.
+OTP_CHANNEL_ORDER = (("email", 150), ("sms", 300))
+
+# The portal renders this dropdown in Chinese on some loads (邮箱 = Email,
+# 短信 = SMS) regardless of the En toggle, so every channel matches both languages.
+OTP_CHANNELS = {
+    "email": {"label": "Email", "pattern": r"Email|邮箱", "tokens": ("EMAIL", "邮箱")},
+    "sms": {"label": "SMS", "pattern": r"SMS|短信", "tokens": ("SMS", "短信")},
+}
 
 STEALTH_SCRIPT = """
 (function() {
@@ -297,6 +316,100 @@ async def save_session(context):
     print("Session cookies saved")
 
 
+async def _select_otp_channel(page, channel: str) -> bool:
+    """Open the antd channel dropdown and pick `channel` ('email' or 'sms').
+
+    #login-form_channel is a hidden antd input — the visible .ant-select-selector
+    ancestor is what actually opens the menu. Returns True if the option was clicked.
+    """
+    spec = OTP_CHANNELS[channel]
+    try:
+        selector = page.locator("#login-form_channel").locator(
+            "xpath=ancestor::div[contains(@class,'ant-select-selector')][1]"
+        )
+        if await selector.count() == 0:
+            selector = page.locator(".ant-select-selector").last
+        await selector.click(force=True, timeout=5000)
+        await page.wait_for_selector(
+            ".ant-select-dropdown:not(.ant-select-dropdown-hidden)",
+            state="visible",
+            timeout=8000,
+        )
+        await page.wait_for_timeout(500)
+        await page.locator(".ant-select-item-option-content").filter(
+            has_text=re.compile(spec["pattern"], re.I)
+        ).first.click(force=True, timeout=8000)
+        await page.wait_for_timeout(1000)
+        print(f"✅ Selected {spec['label']} channel")
+        return True
+    except Exception as e:
+        print(f"⚠️ Error selecting {spec['label']} channel: {e}")
+        return False
+
+
+async def _channel_is_selected(page, channel: str) -> bool:
+    """True if the dropdown currently shows `channel` (survives a page reload)."""
+    try:
+        item = page.locator(".ant-select-selection-item").last
+        if await item.count() == 0:
+            return False
+        text = (await item.inner_text()).upper()
+        return any(token in text for token in OTP_CHANNELS[channel]["tokens"])
+    except Exception:
+        return False
+
+
+async def _accept_checkboxes(page) -> None:
+    """Tick Remember Me + T&C. Both reset whenever the page reloads."""
+    try:
+        rm = page.locator("input#login-form_rememerMe")
+        if not await rm.is_checked():
+            await rm.check(force=True, timeout=3000)
+            print("  ✅ Remember Me checked")
+    except Exception as e:
+        print(f"  ⚠️ Remember Me checkbox: {e}")
+
+    # The T&C wrapper carries a hashed CSS module class that changes between
+    # builds, so fall through progressively looser selectors.
+    for sel in (
+        '.policy___1uV3w input[type="checkbox"]',
+        'div[class*="policy"] input[type="checkbox"]',
+        'input[type="checkbox"]:not(#login-form_rememerMe)',
+    ):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                if not await loc.is_checked():
+                    await loc.check(force=True, timeout=3000)
+                print(f"  ✅ T&C checked via: {sel}")
+                return
+        except Exception:
+            continue
+    print("  ⚠️ Could not find T&C checkbox")
+
+
+async def _click_get_otp(page) -> None:
+    """Press GET to make the portal send a code to the selected channel."""
+    try:
+        await page.click("text=GET", timeout=5000)
+        print("✅ Clicked GET button")
+    except Exception as e:
+        print(f"⚠️ Warning clicking GET: {e}")
+
+
+async def _fetch_otp(channel: str, max_wait: int):
+    """Read a code from whichever reader backs `channel`.
+
+    The two readers have different concurrency models: the Gmail one is a blocking
+    sync call that must go to a worker thread so Playwright keeps pumping its event
+    loop, while the Telegram one is Telethon-native and must be awaited directly —
+    putting it in a thread would build its client on a second event loop.
+    """
+    if channel == "email":
+        return await asyncio.to_thread(get_email_otp, max_age_seconds=max_wait)
+    return await get_sms_otp(max_wait=max_wait)
+
+
 async def login_and_get_context(username: str, password: str):
     pw, browser, context, page = await _launch_browser_safe()
 
@@ -348,83 +461,49 @@ async def login_and_get_context(username: str, password: str):
     await page.fill("#login-form_staffCode", username)
     await page.fill("#login-form_password", password)
 
-    # --- Select OTP Channel (Email) ---
-    # The portal renders this dropdown in Chinese on some loads (邮箱 = Email,
-    # 短信 = SMS) regardless of the En toggle, so match both languages.
-    # #login-form_channel is a hidden antd input — click the visible
-    # .ant-select-selector to actually open the menu.
-    print("Selecting OTP Channel (Email)...")
-    try:
-        selector = page.locator("#login-form_channel").locator(
-            "xpath=ancestor::div[contains(@class,'ant-select-selector')][1]"
-        )
-        if await selector.count() == 0:
-            selector = page.locator(".ant-select-selector").last
-        await selector.click(force=True, timeout=5000)
-        await page.wait_for_selector(
-            ".ant-select-dropdown:not(.ant-select-dropdown-hidden)",
-            state="visible",
-            timeout=8000,
-        )
-        await page.wait_for_timeout(500)
-        await page.locator(".ant-select-item-option-content").filter(
-            has_text=re.compile(r"Email|邮箱", re.I)
-        ).first.click(force=True, timeout=8000)
-        print("✅ Selected Email channel")
-        await page.wait_for_timeout(1000)
-    except Exception as e:
-        print(f"⚠️ Error selecting OTP channel: {e}")
-
-    # --- Accept Checkboxes ---
-    print("Accepting Terms and Conditions...")
-    try:
-        await page.locator("input#login-form_rememerMe").check(force=True, timeout=3000)
-        print("  ✅ Remember Me checked")
-    except Exception as e:
-        print(f"  ⚠️ Remember Me checkbox: {e}")
-    try:
-        # Try multiple selectors for T&C checkbox (CSS hash may change)
-        tc_checked = False
-        tc_selectors = [
-            '.policy___1uV3w input[type="checkbox"]',
-            'div[class*="policy"] input[type="checkbox"]',
-            'input[type="checkbox"]:not(#login-form_rememerMe)',
-        ]
-        for sel in tc_selectors:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() > 0:
-                    await loc.check(force=True, timeout=3000)
-                    tc_checked = True
-                    print(f"  ✅ T&C checked via: {sel}")
-                    break
-            except Exception:
-                continue
-        if not tc_checked:
-            print("  ⚠️ Could not find T&C checkbox")
-        await page.wait_for_timeout(1000)
-    except Exception as e:
-        print(f"  ⚠️ Warning clicking checkboxes: {e}")
-
-    # --- Request OTP ---
-    print("Requesting OTP...")
-    try:
-        await page.click("text=GET", timeout=5000)
-        print("✅ Clicked GET button")
-    except Exception as e:
-        print(f"⚠️ Warning clicking GET: {e}")
-
-    # Screenshot to confirm GET was clicked and OTP field appeared
+    # --- Request OTP, falling back Email → SMS ---
+    # The portal only sends a code to whichever channel was selected at the moment
+    # GET was pressed, so falling back is not merely a matter of polling a different
+    # inbox: the dropdown, the checkboxes and the GET click must all be redone to
+    # make the portal actually send a second code over the other channel.
     os.makedirs("logs", exist_ok=True)
-    await page.wait_for_timeout(2000)
-    await page.screenshot(path="logs/after_get_click.png")
-    print("📸 Screenshot saved to logs/after_get_click.png")
+    otp = None
+    otp_channel = None
 
-    print("Waiting for OTP from Email...")
-    import asyncio
+    for channel, max_wait in OTP_CHANNEL_ORDER:
+        label = OTP_CHANNELS[channel]["label"]
+        print(f"\n--- Requesting OTP via {label} ---")
 
-    # Runs the synchronous Gmail reader in a separate thread so Playwright doesn't freeze
-    otp = await asyncio.to_thread(get_latest_otp)
+        await _select_otp_channel(page, channel)
+
+        print("Accepting Terms and Conditions...")
+        await _accept_checkboxes(page)
+        await page.wait_for_timeout(1000)
+
+        print("Requesting OTP...")
+        await _click_get_otp(page)
+
+        # Screenshot to confirm GET landed and the OTP field appeared
+        await page.wait_for_timeout(2000)
+        shot = f"logs/after_get_click_{channel}.png"
+        await page.screenshot(path=shot)
+        print(f"📸 Screenshot saved to {shot}")
+
+        print(f"Waiting up to {max_wait}s for OTP from {label}...")
+        try:
+            otp = await _fetch_otp(channel, max_wait)
+        except Exception as e:
+            # A reader blowing up (expired Telethon session, Gmail auth failure)
+            # must not abort the run — the other channel may still work.
+            print(f"⚠️ {label} reader failed: {e}")
+            otp = None
+
+        if otp:
+            otp_channel = channel
+            print(f"✅ Got OTP via {label}")
+            break
+
+        print(f"⚠️ No OTP from {label} within {max_wait}s")
 
     if otp:
         print(f"Using OTP: {otp}")
@@ -458,53 +537,16 @@ async def login_and_get_context(username: str, password: str):
             await page.fill("#login-form_staffCode", username)
         await page.fill("#login-form_password", password)
 
-        # Always re-select Email channel (dropdown resets on reload even if text fields survive).
-        # Match English "Email" or Chinese "邮箱" — the portal's language is inconsistent.
-        try:
-            item = page.locator(".ant-select-selection-item").last
-            channel_text = await item.inner_text() if await item.count() > 0 else ""
-            if "Email" not in channel_text and "邮箱" not in channel_text:
-                print("  Re-selecting Email channel...")
-                selector = page.locator("#login-form_channel").locator(
-                    "xpath=ancestor::div[contains(@class,'ant-select-selector')][1]"
-                )
-                if await selector.count() == 0:
-                    selector = page.locator(".ant-select-selector").last
-                await selector.click(force=True, timeout=5000)
-                await page.wait_for_selector(
-                    ".ant-select-dropdown:not(.ant-select-dropdown-hidden)",
-                    state="visible",
-                    timeout=8000,
-                )
-                await page.wait_for_timeout(500)
-                await page.locator(".ant-select-item-option-content").filter(
-                    has_text=re.compile(r"Email|邮箱", re.I)
-                ).first.click(force=True, timeout=8000)
-                await page.wait_for_timeout(500)
-        except Exception as e:
-            print(f"  ⚠️ Re-select channel: {e}")
+        # Re-select the channel the code actually arrived on (the dropdown resets on
+        # reload even when the text fields survive). This must follow otp_channel, not
+        # a fixed value — submitting a code that was sent by email while the form says
+        # SMS gets it rejected as a mismatch.
+        if otp_channel and not await _channel_is_selected(page, otp_channel):
+            print(f"  Re-selecting {OTP_CHANNELS[otp_channel]['label']} channel...")
+            await _select_otp_channel(page, otp_channel)
 
         # Always re-check checkboxes (they reset on reload)
-        try:
-            rm = page.locator("input#login-form_rememerMe")
-            if not await rm.is_checked():
-                await rm.check(force=True, timeout=3000)
-        except Exception:
-            pass
-        for sel in [
-            '.policy___1uV3w input[type="checkbox"]',
-            'div[class*="policy"] input[type="checkbox"]',
-            'input[type="checkbox"]:not(#login-form_rememerMe)',
-        ]:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() > 0:
-                    if not await loc.is_checked():
-                        await loc.check(force=True, timeout=3000)
-                        print(f"  ✅ T&C re-checked")
-                    break
-            except Exception:
-                continue
+        await _accept_checkboxes(page)
 
         try:
             otp_field = page.locator("input#login-form_smsCode")
@@ -607,4 +649,7 @@ async def login_and_get_context(username: str, password: str):
         return browser, context, pw, page
     else:
         await browser.close()
-        raise RuntimeError("Failed to retrieve OTP from Email")
+        tried = ", ".join(
+            f"{OTP_CHANNELS[c]['label']} ({w}s)" for c, w in OTP_CHANNEL_ORDER
+        )
+        raise RuntimeError(f"Failed to retrieve OTP — tried {tried}")

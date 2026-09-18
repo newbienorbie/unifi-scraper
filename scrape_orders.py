@@ -25,6 +25,55 @@ from login_manager import login_and_get_context
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Infrastructure/wholesale offers that appear as their own entry in orderItemList
+# but are never the customer-facing package. An order like 2608000122201886 lists
+# "BitStream" (the access layer) before the real plan, so taking the first offer
+# name would report the carrier product instead of what the customer bought.
+# Matched on the whole normalised name, not as a substring, so a genuine plan that
+# merely mentions one of these words is not discarded.
+GENERIC_OFFER_NAMES = {"bitstream", "broadband bundle"}
+
+
+def _is_generic_offer(name: str) -> bool:
+    """True if `name` is a placeholder/infrastructure offer, not a real package."""
+    return (name or "").strip().lower() in GENERIC_OFFER_NAMES
+
+
+def _offer_name(item: dict) -> str:
+    return item.get("mainOfferName") or item.get("offerName") or ""
+
+
+def select_package(order_items: list) -> str:
+    """Pick the customer-facing package name out of an order's orderItemList.
+
+    Preference order:
+      1. An explicit bundle (mainOfferType "B").
+      2. The first offer that is not infrastructure (see GENERIC_OFFER_NAMES).
+      3. The first offer of any kind — only if every entry was generic, so the
+         row still carries something traceable instead of an empty package.
+    """
+    # 1. Prioritize Main Offer Type "B" (Bundle)
+    for item in order_items:
+        if item.get("mainOfferType") == "B":
+            name = _offer_name(item)
+            if name and not _is_generic_offer(name):
+                return name
+
+    # 2. First real offer, skipping infrastructure entries like BitStream so the
+    #    customer-facing plan further down the list wins.
+    for item in order_items:
+        name = _offer_name(item)
+        if name and not _is_generic_offer(name):
+            return name
+
+    # 3. Last resort: everything was generic.
+    for item in order_items:
+        name = _offer_name(item)
+        if name:
+            return name
+
+    return ""
+
 
 def format_datetime(datetime_str):
     """Convert 20251022093000 to '22 Oct 2025 09:30'"""
@@ -191,13 +240,36 @@ async def click_and_select_all_agents(page) -> int:
         await page.click("span.icon-ic_nav_expand", force=True, timeout=5000)
         await page.wait_for_timeout(1500)
 
-    # Open channel modal
+    # Open channel modal. The trigger is an anchor wrapping an icon-font glyph:
+    #   <a title="Subordinate"><span class="iconfont icon-chooseChannel"></span></a>
+    # The old img[src*=...] / img[alt*=...] pair could never match either element, and
+    # the fallback's timeout propagated straight out of the except, killing the run.
+    # Click the <a> (which carries the handler), not the zero-size span. Resolve it by
+    # title first, then by walking up from the span — the portal localises titles on
+    # some loads, so "Subordinate" alone is not dependable.
     print("  🖼️ Opening channel selection modal...")
     try:
-        await page.click('img[src*="chooseChannel"]', timeout=5000)
+        clicked = await page.evaluate(
+            """() => {
+                const span = document.querySelector('span.icon-chooseChannel');
+                const el = document.querySelector('a[title="Subordinate"]')
+                    || (span && span.closest('a'))
+                    || span;
+                if (!el) return false;
+                el.click();
+                return true;
+            }"""
+        )
+        if not clicked:
+            raise RuntimeError(
+                'neither a[title="Subordinate"] nor span.icon-chooseChannel is in the DOM'
+            )
         await page.wait_for_timeout(2000)
-    except:
-        await page.click('img[alt*="channel"]', timeout=3000)
+    except Exception as e:
+        print(f"  ⚠️ DOM click on channel icon failed ({e}); trying forced click...")
+        await page.click(
+            'a[title="Subordinate"], span.icon-chooseChannel', force=True, timeout=5000
+        )
         await page.wait_for_timeout(2000)
 
     # Set 50/page in modal to minimize clicking "Next"
@@ -931,32 +1003,7 @@ async def scrape_orders_month(
 
                             # --- MOVED UP: Package Logic (Needed for Company Name check) ---
                             order_items = data.get("orderItemList", []) or []
-                            package = ""
-                            broadband_package = ""
-
-                            # 1. Prioritize Main Offer Type "B" (Bundle)
-                            for item in order_items:
-                                if item.get("mainOfferType") == "B":
-                                    broadband_package = (
-                                        item.get("mainOfferName")
-                                        or item.get("offerName")
-                                        or ""
-                                    )
-                                    if broadband_package:
-                                        package = broadband_package
-                                        break
-
-                            # 2. Fallback to the first main offer name if no Bundle is found
-                            if not package:
-                                for item in order_items:
-                                    offer_name = (
-                                        item.get("mainOfferName")
-                                        or item.get("offerName")
-                                        or ""
-                                    )
-                                    if offer_name:
-                                        package = offer_name
-                                        break
+                            package = select_package(order_items)
 
                             # --- Company Name Logic ---
                             company_name = ""
